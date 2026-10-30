@@ -9,11 +9,13 @@ use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 use walkdir::WalkDir;
 
+pub mod go_graph;
 pub mod manifests;
 pub mod pool;
 pub mod rust_graph;
 pub mod ts_graph;
 
+pub use go_graph::{derive_go_package_path, extract_go_file_facts, GoFactOptions};
 pub use manifests::WorkspaceManifests;
 pub use pool::{CallEdge, CompactCallEdge, StringPool, SymbolId};
 pub use rust_graph::{
