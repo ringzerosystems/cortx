@@ -12,6 +12,7 @@ use walkdir::WalkDir;
 pub mod manifests;
 pub mod pool;
 pub mod rust_graph;
+pub mod ts_graph;
 
 pub use manifests::WorkspaceManifests;
 pub use pool::{CallEdge, CompactCallEdge, StringPool, SymbolId};
@@ -19,6 +20,7 @@ pub use rust_graph::{
     ContainerKind, ExportEntry, FileFacts, RawCallSite, RawCalleeTarget, RustFactOptions, TypeRef,
     extract_rust_file_facts,
 };
+pub use ts_graph::{extract_ts_file_facts, normalize_ts_module_path, TsFactOptions};
 
 /// Information describing a trait contract implementation (`impl Trait for Target`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
