@@ -1440,5 +1440,9 @@ pub fn is_ignored_path(path: &Path) -> bool {
 }
 
 #[cfg(test)]
+mod manifests_tests;
+#[cfg(test)]
+mod polyglot_link_tests;
+#[cfg(test)]
 #[path = "../indexer_tests.rs"]
 mod tests;

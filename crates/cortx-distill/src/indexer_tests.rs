@@ -716,7 +716,8 @@ fn test_string_pool() {
     assert_eq!(pool.len(), 2);
     assert!(!pool.is_empty());
 
-    // Verify CompactCallEdge size is exactly 16 bytes
+    // Verify CompactCallEdge size is exactly 16 bytes (4 * 4-byte fields)
+    assert_eq!(std::mem::size_of::<SymbolId>(), 4);
     assert_eq!(std::mem::size_of::<CompactCallEdge>(), 16);
     let edge = CompactCallEdge {
         caller: id_a,
@@ -727,6 +728,7 @@ fn test_string_pool() {
     assert_eq!(edge.caller, id_a);
     assert_eq!(edge.callee, id_c);
     assert_eq!(edge.file, id_a);
+    assert_eq!(edge.call_line, 0);
 }
 
 #[test]
