@@ -60,7 +60,7 @@ make audit             # cargo audit (RustSec security vulnerability scan; requi
 make loc               # scripts/loc.sh: fail on any Rust file over 1500 lines of code
 make clean             # cargo clean
 
-# CLI & Engine Tool Invocations (`cargo cortx` / `cargo groundtruth`)
+# CLI & Engine Tool Invocations (`cargo cortx`)
 cargo cortx distill <FILE>                                           # extract type skeleton (Rust / TS / TSX / Go)
 cargo cortx distill <FILE> --cross-boundary                          # distill with Rust <-> TS <-> Go route & interface correlation
 cargo cortx daemon                                                 # start system-wide multi-tenant indexing daemon (or --isolated)
