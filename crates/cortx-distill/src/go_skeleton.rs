@@ -442,14 +442,16 @@ fn resolve_go_contracts(
     contracts
 }
 
-fn extract_go_routes(file_path: &str, content: &str, omit_tests: bool) -> Vec<RouteBinding> {
-    let mut routes = Vec::new();
-    let route_regex = regex::Regex::new(
+static GO_ROUTE_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
         r#"(?:r|router|e|echo|app|http|mux)\s*\.\s*(GET|POST|PUT|DELETE|PATCH|Get|Post|Put|Delete|Patch|HandleFunc)\s*\(\s*["'`]([^"'`]+)["'`]\s*,\s*([a-zA-Z0-9_\.]+)"#,
     )
-    .unwrap();
+    .expect("valid Go route regex")
+});
 
-    for cap in route_regex.captures_iter(content) {
+fn extract_go_routes(file_path: &str, content: &str, omit_tests: bool) -> Vec<RouteBinding> {
+    let mut routes = Vec::new();
+    for cap in GO_ROUTE_REGEX.captures_iter(content) {
         if let (Some(m), Some(path_match), Some(handler_match)) =
             (cap.get(0), cap.get(2), cap.get(3))
         {
