@@ -1,0 +1,34 @@
+[package]
+name = "cargo-cortx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "AGPL-3.0-only OR LicenseRef-RingZero-Commercial"
+authors.workspace = true
+default-run = "cargo-cortx"
+build = "build.rs"
+
+[[bin]]
+name = "cargo-cortx"
+path = "src/main.rs"
+
+[[bin]]
+name = "cortx"
+path = "src/cortx.rs"
+
+[dependencies]
+cortx-core = { workspace = true }
+cortx-distill = { workspace = true }
+cortx-daemon = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+colored = { workspace = true }
+anstream = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

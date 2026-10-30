@@ -1,0 +1,53 @@
+# cortx.example.toml
+# System daemon and multi-project configuration template for cortx
+
+[daemon]
+system_daemon = true
+lazy_indexing = true
+idle_ttl_secs = 7200
+enable_file_watcher = true
+workspace_logging = true
+
+[projects.acme-fullstack]
+path = "/path/to/acme"
+has_worktrees = true
+lang = ["rust", "typescript"]
+omit_tests = true
+
+[projects.acme-fullstack.distill]
+omit_tests = true
+
+[projects.acme-fullstack.typescript]
+enabled = true
+strip_jsx = true
+strip_hook_bodies = true
+
+[projects.acme-fullstack.cross_boundary]
+strict_casing_check = true
+
+[projects.payment-service]
+path = "/path/to/payment"
+has_worktrees = false
+lang = ["go"]
+
+[projects.payment-service.go]
+enabled = true
+index_implicit_interfaces = true
+
+[projects.storage-engine]
+path = "/path/to/storage"
+has_worktrees = false
+lang = ["rust"]
+
+[projects.storage-engine.distill]
+max_call_depth = 3
+omit_tests = true
+
+[projects.web-dashboard]
+path = "/path/to/web"
+has_worktrees = false
+lang = ["typescript"]
+codebase_scale = "small"
+
+[projects.web-dashboard.typescript]
+enabled = true

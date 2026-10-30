@@ -1,0 +1,8 @@
+.context/
+target/
+profiles/
+__pycache__/
+*.pyc
+*.pyo
+*.py[cod]
+*.DS_Store
