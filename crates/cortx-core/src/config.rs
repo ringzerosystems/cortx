@@ -715,7 +715,7 @@ pub fn resolve_global_config_path() -> PathBuf {
     resolve_default_config_path()
 }
 
-fn canonicalize_best_effort(path: &Path) -> PathBuf {
+pub fn canonicalize_best_effort(path: &Path) -> PathBuf {
     if let Ok(c) = std::fs::canonicalize(path) {
         return c;
     }
