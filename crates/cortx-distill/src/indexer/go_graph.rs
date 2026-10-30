@@ -320,13 +320,15 @@ impl<'a> GoFactExtractor<'a> {
         if let Some(name_node) = node.child_by_field_name("name") {
             let alias = self.content[name_node.byte_range()].trim();
             if alias != "_" && alias != "." && !alias.is_empty() {
-                self.imports.insert(alias.to_string(), clean_path.to_string());
+                self.imports
+                    .insert(alias.to_string(), clean_path.to_string());
                 return;
             }
         }
 
         let default_alias = clean_path.split('/').next_back().unwrap_or(clean_path);
-        self.imports.insert(default_alias.to_string(), clean_path.to_string());
+        self.imports
+            .insert(default_alias.to_string(), clean_path.to_string());
     }
 
     fn parse_go_type(&self, node: tree_sitter::Node<'_>) -> TypeRef {
@@ -486,7 +488,11 @@ impl<'a> GoFactExtractor<'a> {
         let type_node = decl.child_by_field_name("type");
         let Some(type_node) = type_node else {
             let text = self.content[decl.byte_range()].trim();
-            let field_name = text.split('.').next_back().unwrap_or(text).trim_start_matches('*');
+            let field_name = text
+                .split('.')
+                .next_back()
+                .unwrap_or(text)
+                .trim_start_matches('*');
             if !field_name.is_empty() {
                 let ty_ref = self.parse_go_type(decl);
                 fields_map.insert(field_name.to_string(), ty_ref);
@@ -508,7 +514,11 @@ impl<'a> GoFactExtractor<'a> {
 
         if !found_name {
             let text = &self.content[type_node.byte_range()];
-            let field_name = text.split('.').next_back().unwrap_or(text).trim_start_matches('*');
+            let field_name = text
+                .split('.')
+                .next_back()
+                .unwrap_or(text)
+                .trim_start_matches('*');
             if !field_name.is_empty() {
                 fields_map.insert(field_name.to_string(), ty_ref);
             }
@@ -567,7 +577,9 @@ impl<'a> GoFactExtractor<'a> {
     fn record_method_declaration(&mut self, node: tree_sitter::Node<'_>) {
         let name_node = node.child_by_field_name("name");
         let recv_node = node.child_by_field_name("receiver");
-        let (Some(name_node), Some(recv_node)) = (name_node, recv_node) else { return };
+        let (Some(name_node), Some(recv_node)) = (name_node, recv_node) else {
+            return;
+        };
 
         let name = self.content[name_node.byte_range()].to_string();
         let (recv_var, recv_type, is_pointer) = self.parse_receiver(recv_node);
@@ -730,7 +742,9 @@ impl<'a> GoFactExtractor<'a> {
         local_vars: &mut HashMap<String, TypeRef>,
     ) {
         match node.kind() {
-            "short_var_declaration" => self.handle_short_var_declaration(node, caller_fqn, local_vars),
+            "short_var_declaration" => {
+                self.handle_short_var_declaration(node, caller_fqn, local_vars)
+            }
             "var_declaration" => self.handle_var_declaration(node, caller_fqn, local_vars),
             "call_expression" => {
                 self.handle_call_expression(node, caller_fqn, local_vars);
@@ -825,7 +839,9 @@ impl<'a> GoFactExtractor<'a> {
                     }
                 }
 
-                let ty_ref = type_node.map(|tn| self.parse_go_type(tn)).unwrap_or(TypeRef::Unknown);
+                let ty_ref = type_node
+                    .map(|tn| self.parse_go_type(tn))
+                    .unwrap_or(TypeRef::Unknown);
                 for (idx, name) in var_names.into_iter().enumerate() {
                     let resolved_ty = if ty_ref != TypeRef::Unknown {
                         ty_ref.clone()
@@ -920,7 +936,9 @@ impl<'a> GoFactExtractor<'a> {
         caller_fqn: &str,
         local_vars: &HashMap<String, TypeRef>,
     ) {
-        let Some(func) = node.child_by_field_name("function") else { return };
+        let Some(func) = node.child_by_field_name("function") else {
+            return;
+        };
         let call_line = self.line_index.line_number(node.start_byte()) as u32;
 
         if func.kind() == "selector_expression" {
@@ -945,7 +963,9 @@ impl<'a> GoFactExtractor<'a> {
     ) {
         let op = func.child_by_field_name("operand");
         let field = func.child_by_field_name("field");
-        let (Some(op), Some(field)) = (op, field) else { return };
+        let (Some(op), Some(field)) = (op, field) else {
+            return;
+        };
         let field_name = &self.content[field.byte_range()];
 
         let target = if op.kind() == "identifier" {
@@ -1002,10 +1022,7 @@ impl<'a> GoFactExtractor<'a> {
     }
 }
 
-fn decompose_selector_chain(
-    node: tree_sitter::Node<'_>,
-    content: &str,
-) -> (String, Vec<String>) {
+fn decompose_selector_chain(node: tree_sitter::Node<'_>, content: &str) -> (String, Vec<String>) {
     let mut current = node;
     let mut fields = Vec::new();
 
@@ -1135,8 +1152,14 @@ func (h *Handler) Handle() {
         assert_eq!(facts.calls.len(), 4);
 
         // Call 1: fmt.Println
-        assert_eq!(facts.calls[0].caller_fqn, "github.com/acme/project/internal/handler.Handler.Handle");
-        assert_eq!(facts.calls[0].target, RawCalleeTarget::Path("fmt.Println".to_string()));
+        assert_eq!(
+            facts.calls[0].caller_fqn,
+            "github.com/acme/project/internal/handler.Handler.Handle"
+        );
+        assert_eq!(
+            facts.calls[0].target,
+            RawCalleeTarget::Path("fmt.Println".to_string())
+        );
 
         // Call 2: custom.DoWork
         assert_eq!(

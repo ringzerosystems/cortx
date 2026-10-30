@@ -13,8 +13,10 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 static CLIENT_ROUTE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?:fetch|invoke|axios\s*\.\s*(?:get|post|put|delete|patch))\s*\(\s*["'`]([^"'`]+)["'`]"#)
-        .expect("valid client route regex")
+    Regex::new(
+        r#"(?:fetch|invoke|axios\s*\.\s*(?:get|post|put|delete|patch))\s*\(\s*["'`]([^"'`]+)["'`]"#,
+    )
+    .expect("valid client route regex")
 });
 
 /// Configuration options for Phase-1 TypeScript / JS AST fact extraction.
@@ -303,8 +305,7 @@ impl<'a> TsFactExtractor<'a> {
     }
 
     fn walk_export_default(&mut self, decl: &ExportDefaultDeclaration<'_>) {
-        self.exports
-            .push(ExportEntry::Local("default".to_string()));
+        self.exports.push(ExportEntry::Local("default".to_string()));
         let module_caller = format!("{}::<module>", self.rel_module);
         match &decl.declaration {
             ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
@@ -847,16 +848,17 @@ impl<'a> TsFactExtractor<'a> {
             Expression::Identifier(ident) => {
                 let name = ident.name.as_str();
                 if let Some(binding) = self.imports.get(name) {
-                    RawCalleeTarget::Path(format!("{}::{}", binding.specifier, binding.imported_name))
+                    RawCalleeTarget::Path(format!(
+                        "{}::{}",
+                        binding.specifier, binding.imported_name
+                    ))
                 } else if self.local_declarations.contains(name) {
                     RawCalleeTarget::Path(format!("{}::{}", self.rel_module, name))
                 } else {
                     RawCalleeTarget::Path(name.to_string())
                 }
             }
-            Expression::StaticMemberExpression(expr) => {
-                self.resolve_static_member_target(expr)
-            }
+            Expression::StaticMemberExpression(expr) => self.resolve_static_member_target(expr),
             Expression::ParenthesizedExpression(p) => self.resolve_callee_target(&p.expression),
             _ => RawCalleeTarget::Path("".to_string()),
         }
@@ -903,7 +905,8 @@ impl<'a> TsFactExtractor<'a> {
             }
             _ => {
                 if let Some((root_receiver, fields)) = flatten_member_chain(&expr.object) {
-                    let final_receiver = if matches!(&root_receiver, TypeRef::Known { type_name, .. } if type_name == "this") {
+                    let final_receiver = if matches!(&root_receiver, TypeRef::Known { type_name, .. } if type_name == "this")
+                    {
                         TypeRef::Known {
                             crate_or_pkg: "".to_string(),
                             type_name: self.current_class.clone().unwrap_or_default(),
@@ -1148,7 +1151,11 @@ export const helperArrow = (x: number) => {
         let facts = extract_ts_file_facts(&opts, code).expect("extract facts");
         assert_eq!(facts.crate_or_pkg, "@acme/frontend");
 
-        let sym_fqns: Vec<_> = facts.symbols.iter().map(|s| s.qualified_name.as_str()).collect();
+        let sym_fqns: Vec<_> = facts
+            .symbols
+            .iter()
+            .map(|s| s.qualified_name.as_str())
+            .collect();
         assert!(sym_fqns.contains(&"frontend/src/user::UserPayload"));
         assert!(sym_fqns.contains(&"frontend/src/user::UserId"));
         assert!(sym_fqns.contains(&"frontend/src/user::Status"));
@@ -1163,9 +1170,21 @@ export const helperArrow = (x: number) => {
         }
 
         assert_eq!(facts.exports.len(), 6);
-        assert!(facts.exports.contains(&ExportEntry::Local("UserPayload".to_string())));
-        assert!(facts.exports.contains(&ExportEntry::Local("UserService".to_string())));
-        assert!(facts.exports.contains(&ExportEntry::Local("fetchUser".to_string())));
+        assert!(
+            facts
+                .exports
+                .contains(&ExportEntry::Local("UserPayload".to_string()))
+        );
+        assert!(
+            facts
+                .exports
+                .contains(&ExportEntry::Local("UserService".to_string()))
+        );
+        assert!(
+            facts
+                .exports
+                .contains(&ExportEntry::Local("fetchUser".to_string()))
+        );
     }
 
     #[test]
@@ -1199,7 +1218,11 @@ export default function main() {}
         assert!(facts.exports.contains(&ExportEntry::StarReExport {
             specifier: "./theme".to_string(),
         }));
-        assert!(facts.exports.contains(&ExportEntry::Local("default".to_string())));
+        assert!(
+            facts
+                .exports
+                .contains(&ExportEntry::Local("default".to_string()))
+        );
     }
 
     #[test]
@@ -1251,7 +1274,10 @@ function topFn() {
         let ns_call = run_calls
             .iter()
             .find(|c| matches!(&c.target, RawCalleeTarget::Path(p) if p == "./api::sendMetrics"));
-        assert!(ns_call.is_some(), "should resolve namespace api.sendMetrics()");
+        assert!(
+            ns_call.is_some(),
+            "should resolve namespace api.sendMetrics()"
+        );
 
         let helper_call = run_calls
             .iter()

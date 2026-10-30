@@ -31,6 +31,12 @@ pub struct WorkspaceManifests {
     pub resolver: Resolver,
 }
 
+impl Default for WorkspaceManifests {
+    fn default() -> Self {
+        Self::discover(Path::new("."), &[])
+    }
+}
+
 impl WorkspaceManifests {
     /// Discovers all manifests in the workspace root, ignoring specified directory names.
     pub fn discover(workspace_root: &Path, ignored_dirs: &[String]) -> Self {
@@ -38,8 +44,7 @@ impl WorkspaceManifests {
             .canonicalize()
             .unwrap_or_else(|_| workspace_root.to_path_buf());
 
-        let (root_pkg_name, mut patterns) =
-            parse_root_package_json(&root.join("package.json"));
+        let (root_pkg_name, mut patterns) = parse_root_package_json(&root.join("package.json"));
         patterns.extend(parse_pnpm_workspace_packages(
             &root.join("pnpm-workspace.yaml"),
         ));
@@ -496,7 +501,10 @@ fn build_oxc_resolver(root: &Path, ts_packages: &HashMap<String, PathBuf>) -> Re
             ".json".into(),
         ],
         extension_alias: vec![
-            (".js".into(), vec![".ts".into(), ".tsx".into(), ".js".into()]),
+            (
+                ".js".into(),
+                vec![".ts".into(), ".tsx".into(), ".js".into()],
+            ),
             (".mjs".into(), vec![".mts".into(), ".mjs".into()]),
             (".cjs".into(), vec![".cts".into(), ".cjs".into()]),
         ],
@@ -600,17 +608,35 @@ mod tests {
 
     #[test]
     fn test_is_manifest_path() {
-        assert!(WorkspaceManifests::is_manifest_path(Path::new("Cargo.toml")));
-        assert!(WorkspaceManifests::is_manifest_path(Path::new("crates/core/Cargo.toml")));
+        assert!(WorkspaceManifests::is_manifest_path(Path::new(
+            "Cargo.toml"
+        )));
+        assert!(WorkspaceManifests::is_manifest_path(Path::new(
+            "crates/core/Cargo.toml"
+        )));
         assert!(WorkspaceManifests::is_manifest_path(Path::new("go.mod")));
-        assert!(WorkspaceManifests::is_manifest_path(Path::new("package.json")));
-        assert!(WorkspaceManifests::is_manifest_path(Path::new("pnpm-workspace.yaml")));
-        assert!(WorkspaceManifests::is_manifest_path(Path::new("tsconfig.json")));
-        assert!(WorkspaceManifests::is_manifest_path(Path::new("tsconfig.base.json")));
+        assert!(WorkspaceManifests::is_manifest_path(Path::new(
+            "package.json"
+        )));
+        assert!(WorkspaceManifests::is_manifest_path(Path::new(
+            "pnpm-workspace.yaml"
+        )));
+        assert!(WorkspaceManifests::is_manifest_path(Path::new(
+            "tsconfig.json"
+        )));
+        assert!(WorkspaceManifests::is_manifest_path(Path::new(
+            "tsconfig.base.json"
+        )));
 
-        assert!(!WorkspaceManifests::is_manifest_path(Path::new("src/lib.rs")));
-        assert!(!WorkspaceManifests::is_manifest_path(Path::new("Cargo.lock")));
-        assert!(!WorkspaceManifests::is_manifest_path(Path::new("workspace.yaml")));
+        assert!(!WorkspaceManifests::is_manifest_path(Path::new(
+            "src/lib.rs"
+        )));
+        assert!(!WorkspaceManifests::is_manifest_path(Path::new(
+            "Cargo.lock"
+        )));
+        assert!(!WorkspaceManifests::is_manifest_path(Path::new(
+            "workspace.yaml"
+        )));
     }
 
     #[test]
@@ -804,7 +830,11 @@ packages:
 
         // Create both compiled dist/index.js AND source src/index.tsx
         std::fs::write(ui_dist.join("index.js"), "module.exports = {};").unwrap();
-        std::fs::write(ui_src.join("index.tsx"), "export const Button = () => null;").unwrap();
+        std::fs::write(
+            ui_src.join("index.tsx"),
+            "export const Button = () => null;",
+        )
+        .unwrap();
 
         let manifests = WorkspaceManifests::discover(root, &[]);
         assert!(manifests.ts_packages.contains_key("@acme/ui"));

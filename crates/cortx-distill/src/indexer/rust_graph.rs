@@ -500,7 +500,8 @@ impl RustFactVisitor {
                 || attr_str.contains("put")
                 || attr_str.contains("delete")
             {
-                let route_path = extract_attr_literal(&attr_str).unwrap_or_else(|| name.to_string());
+                let route_path =
+                    extract_attr_literal(&attr_str).unwrap_or_else(|| name.to_string());
                 self.routes.push(RouteBinding::new(
                     route_path,
                     name.to_string(),
@@ -946,10 +947,11 @@ pub fn extract_rust_file_facts(
     opts: &RustFactOptions<'_>,
     content: &str,
 ) -> Result<FileFacts, DistillError> {
-    let ast = syn::parse_str::<syn::File>(content).map_err(|source| DistillError::ParseFailure {
-        path: opts.file_path.to_path_buf(),
-        source,
-    })?;
+    let ast =
+        syn::parse_str::<syn::File>(content).map_err(|source| DistillError::ParseFailure {
+            path: opts.file_path.to_path_buf(),
+            source,
+        })?;
 
     let mut visitor = RustFactVisitor::new(opts);
     visitor.visit_file(&ast);
@@ -1023,7 +1025,11 @@ mod internal {
         };
 
         let facts = extract_rust_file_facts(&opts, code).expect("facts extraction");
-        let sym_names: Vec<_> = facts.symbols.iter().map(|s| s.qualified_name.as_str()).collect();
+        let sym_names: Vec<_> = facts
+            .symbols
+            .iter()
+            .map(|s| s.qualified_name.as_str())
+            .collect();
         assert!(sym_names.contains(&"acme::service::Service"));
         assert!(sym_names.contains(&"acme::service::Service::new"));
         assert!(sym_names.contains(&"acme::service::Service::run"));
@@ -1062,11 +1068,18 @@ pub fn run_loop(client: Client) {
         let client_call = facts.calls.iter().find(|c| {
             matches!(&c.target, RawCalleeTarget::Method { method_name, .. } if method_name == "recv")
         });
-        assert!(client_call.is_some(), "should extract client.recv() inside macro");
+        assert!(
+            client_call.is_some(),
+            "should extract client.recv() inside macro"
+        );
 
-        let handle_call = facts.calls.iter().find(|c| {
-            matches!(&c.target, RawCalleeTarget::Path(p) if p == "handle_event")
-        });
-        assert!(handle_call.is_some(), "should extract handle_event() inside macro");
+        let handle_call = facts
+            .calls
+            .iter()
+            .find(|c| matches!(&c.target, RawCalleeTarget::Path(p) if p == "handle_event"));
+        assert!(
+            handle_call.is_some(),
+            "should extract handle_event() inside macro"
+        );
     }
 }
