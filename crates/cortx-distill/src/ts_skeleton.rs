@@ -358,6 +358,12 @@ fn format_function(
 
     let async_str = if func.r#async { "async " } else { "" };
 
+    let type_params = func
+        .type_parameters
+        .as_ref()
+        .and_then(|tp| safe_slice(src, tp.span.start as usize, tp.span.end as usize))
+        .unwrap_or("");
+
     // Format params
     let params_str = if is_component && func.params.items.len() == 1 {
         let first_param = &func.params.items[0];
@@ -390,8 +396,7 @@ fn format_function(
     };
 
     Some(format!(
-        "{}function {}{}({}){};",
-        prefix, async_str, name, params_str, return_str
+        "{prefix}{async_str}function {name}{type_params}({params_str}){return_str};"
     ))
 }
 
@@ -423,10 +428,23 @@ fn format_class(cls: &Class<'_>, src: &str, is_export: bool, is_default: bool) -
     for element in &cls.body.body {
         match element {
             ClassElement::MethodDefinition(method) => {
+                let vis_str = method
+                    .accessibility
+                    .map(|a| format!("{} ", a.as_str()))
+                    .unwrap_or_default();
+                let static_str = if method.r#static { "static " } else { "" };
+                let override_str = if method.r#override { "override " } else { "" };
+                let async_str = if method.value.r#async { "async " } else { "" };
                 let m_name = method
                     .key
                     .name()
                     .unwrap_or(std::borrow::Cow::Borrowed("method"));
+                let type_params = method
+                    .value
+                    .type_parameters
+                    .as_ref()
+                    .and_then(|tp| safe_slice(src, tp.span.start as usize, tp.span.end as usize))
+                    .unwrap_or("");
                 let span = method.value.params.span;
                 let params =
                     safe_slice(src, span.start as usize, span.end as usize).unwrap_or("()");
@@ -441,7 +459,9 @@ fn format_class(cls: &Class<'_>, src: &str, is_export: bool, is_default: bool) -
                 } else {
                     String::new()
                 };
-                out.push_str(&format!("    {m_name}{params}{ret_str};\n"));
+                out.push_str(&format!(
+                    "    {vis_str}{static_str}{override_str}{async_str}{m_name}{type_params}{params}{ret_str};\n"
+                ));
             }
             ClassElement::PropertyDefinition(prop) => {
                 let p_span = prop.span;
@@ -763,5 +783,58 @@ export function noParams(): void {}
         assert!(res.contains("export * as math from \"./math\";"));
         assert!(res.contains("export function calculateUnicode(α: string, 変数: number): string;"));
         assert!(res.contains("export function noParams(): void;"));
+    }
+
+    #[test]
+    fn test_async_modifiers_and_semicolon_syntax() {
+        let code = r#"
+export async function fetchUser<T>(id: string): Promise<T> {
+    const res = await fetch(`/users/${id}`);
+    return await res.json();
+}
+
+async function internalCompute(val: number): Promise<number> {
+    return val * 42;
+}
+
+export default async function runService(): Promise<void> {
+    console.log("running");
+}
+
+export class ServiceWorker {
+    public static async init(): Promise<void> {
+        console.log("init");
+    }
+
+    async process(): Promise<boolean> {
+        return true;
+    }
+
+    protected async cleanup(): Promise<void> {
+        console.log("cleanup");
+    }
+
+    syncMethod(): void {
+        console.log("sync");
+    }
+}
+"#;
+
+        let res = extract_ts_skeleton_with_options(code, false, true).unwrap();
+
+        // Function declarations modifier order and semicolon termination
+        assert!(res.contains("export async function fetchUser<T>(id: string): Promise<T>;"));
+        assert!(res.contains("async function internalCompute(val: number): Promise<number>;"));
+        assert!(res.contains("export default async function runService(): Promise<void>;"));
+
+        // Class method modifier order and semicolon termination
+        assert!(res.contains("public static async init(): Promise<void>;"));
+        assert!(res.contains("async process(): Promise<boolean>;"));
+        assert!(res.contains("protected async cleanup(): Promise<void>;"));
+        assert!(res.contains("syncMethod(): void;"));
+
+        // No invalid function async or trailing function bodies
+        assert!(!res.contains("function async"));
+        assert!(!res.contains("async export"));
     }
 }
