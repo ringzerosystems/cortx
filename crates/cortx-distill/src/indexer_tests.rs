@@ -533,6 +533,7 @@ fn test_get_file_symbols_fast_path_and_normalization() {
         file: file1.to_string(),
         line: 10,
         language: "rust".to_string(),
+        ..Default::default()
     });
     idx.record_symbol(SymbolDef {
         name: "ApiService".to_string(),
@@ -540,6 +541,7 @@ fn test_get_file_symbols_fast_path_and_normalization() {
         file: file2.to_string(),
         line: 15,
         language: "rust".to_string(),
+        ..Default::default()
     });
 
     // 1. Exact path lookup
@@ -587,6 +589,7 @@ fn test_collect_callers_and_callees_equivalence_and_dedup() {
         file: file.to_string(),
         line: 1,
         language: "rust".to_string(),
+        ..Default::default()
     });
     idx.record_symbol(SymbolDef {
         name: "helper".to_string(),
@@ -594,6 +597,7 @@ fn test_collect_callers_and_callees_equivalence_and_dedup() {
         file: file.to_string(),
         line: 10,
         language: "rust".to_string(),
+        ..Default::default()
     });
 
     let edge_a = CallEdge {

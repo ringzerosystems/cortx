@@ -232,6 +232,8 @@ pub fn index_go_ast_with_options(
                         file: file_path.to_string(),
                         line,
                         language: "go".to_string(),
+                        end_line: line,
+                        qualified_name: String::new(),
                     });
                 }
             }
@@ -288,6 +290,8 @@ fn extract_type_decl(
                             file: file_path.to_string(),
                             line,
                             language: "go".to_string(),
+                            end_line: line,
+                            qualified_name: String::new(),
                         });
                         structs.push((name, line));
                     }
@@ -298,6 +302,8 @@ fn extract_type_decl(
                             file: file_path.to_string(),
                             line,
                             language: "go".to_string(),
+                            end_line: line,
+                            qualified_name: String::new(),
                         });
                         let req_methods = extract_interface_methods(type_node.unwrap(), content);
                         interfaces.push(RawInterface {
@@ -312,6 +318,8 @@ fn extract_type_decl(
                             file: file_path.to_string(),
                             line,
                             language: "go".to_string(),
+                            end_line: line,
+                            qualified_name: String::new(),
                         });
                     }
                 }

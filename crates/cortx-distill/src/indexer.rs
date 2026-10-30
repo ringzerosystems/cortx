@@ -11,8 +11,14 @@ use walkdir::WalkDir;
 
 pub mod manifests;
 pub mod pool;
+pub mod rust_graph;
+
 pub use manifests::WorkspaceManifests;
 pub use pool::{CallEdge, CompactCallEdge, StringPool, SymbolId};
+pub use rust_graph::{
+    ContainerKind, ExportEntry, FileFacts, RawCallSite, RawCalleeTarget, RustFactOptions, TypeRef,
+    extract_rust_file_facts,
+};
 
 /// Information describing a trait contract implementation (`impl Trait for Target`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,7 +34,7 @@ pub struct ContractInfo {
 }
 
 /// Symbol definition entry in the index.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolDef {
     /// Symbol name.
     pub name: String,
@@ -42,6 +48,12 @@ pub struct SymbolDef {
     /// Language origin ("rust" or "typescript").
     #[serde(default = "default_rust_lang")]
     pub language: String,
+    /// End line number where declared (1-indexed, inclusive).
+    #[serde(default)]
+    pub end_line: usize,
+    /// Fully-qualified symbol identifier.
+    #[serde(default)]
+    pub qualified_name: String,
 }
 
 fn default_line() -> usize {
@@ -764,6 +776,8 @@ impl SymbolIndex {
                         file: file_path.to_string(),
                         line,
                         language: "typescript".to_string(),
+                        end_line: line,
+                        ..Default::default()
                     });
                 }
                 oxc_ast::ast::Statement::TSTypeAliasDeclaration(decl) => {
@@ -775,6 +789,8 @@ impl SymbolIndex {
                         file: file_path.to_string(),
                         line,
                         language: "typescript".to_string(),
+                        end_line: line,
+                        ..Default::default()
                     });
                 }
                 oxc_ast::ast::Statement::TSEnumDeclaration(decl) => {
@@ -786,6 +802,8 @@ impl SymbolIndex {
                         file: file_path.to_string(),
                         line,
                         language: "typescript".to_string(),
+                        end_line: line,
+                        ..Default::default()
                     });
                 }
                 oxc_ast::ast::Statement::FunctionDeclaration(func) => {
@@ -798,6 +816,8 @@ impl SymbolIndex {
                             file: file_path.to_string(),
                             line,
                             language: "typescript".to_string(),
+                            end_line: line,
+                            ..Default::default()
                         });
                     }
                 }
@@ -811,6 +831,8 @@ impl SymbolIndex {
                                 file: file_path.to_string(),
                                 line,
                                 language: "typescript".to_string(),
+                                end_line: line,
+                                ..Default::default()
                             });
                         }
                     }
@@ -859,6 +881,8 @@ impl SymbolIndex {
                     file: file_path.to_string(),
                     line,
                     language: "typescript".to_string(),
+                    end_line: line,
+                    ..Default::default()
                 });
             }
             oxc_ast::ast::Declaration::TSTypeAliasDeclaration(d) => {
@@ -870,6 +894,8 @@ impl SymbolIndex {
                     file: file_path.to_string(),
                     line,
                     language: "typescript".to_string(),
+                    end_line: line,
+                    ..Default::default()
                 });
             }
             oxc_ast::ast::Declaration::TSEnumDeclaration(d) => {
@@ -881,6 +907,8 @@ impl SymbolIndex {
                     file: file_path.to_string(),
                     line,
                     language: "typescript".to_string(),
+                    end_line: line,
+                    ..Default::default()
                 });
             }
             oxc_ast::ast::Declaration::FunctionDeclaration(func) => {
@@ -893,6 +921,8 @@ impl SymbolIndex {
                         file: file_path.to_string(),
                         line,
                         language: "typescript".to_string(),
+                        end_line: line,
+                        ..Default::default()
                     });
                 }
             }
@@ -906,6 +936,8 @@ impl SymbolIndex {
                             file: file_path.to_string(),
                             line,
                             language: "typescript".to_string(),
+                            end_line: line,
+                            ..Default::default()
                         });
                     }
                 }
@@ -1401,6 +1433,8 @@ impl<'a> Visit<'_> for IndexVisitor<'a> {
             file: self.file_path.to_string(),
             line,
             language: "rust".to_string(),
+            end_line: line,
+            ..Default::default()
         });
 
         for attr in &node.attrs {
@@ -1447,6 +1481,8 @@ impl<'a> Visit<'_> for IndexVisitor<'a> {
             file: self.file_path.to_string(),
             line,
             language: "rust".to_string(),
+            end_line: line,
+            ..Default::default()
         });
         syn::visit::visit_item_struct(self, node);
     }
@@ -1464,6 +1500,8 @@ impl<'a> Visit<'_> for IndexVisitor<'a> {
             file: self.file_path.to_string(),
             line,
             language: "rust".to_string(),
+            end_line: line,
+            ..Default::default()
         });
         syn::visit::visit_item_enum(self, node);
     }
@@ -1481,6 +1519,8 @@ impl<'a> Visit<'_> for IndexVisitor<'a> {
             file: self.file_path.to_string(),
             line,
             language: "rust".to_string(),
+            end_line: line,
+            ..Default::default()
         });
         syn::visit::visit_item_trait(self, node);
     }
