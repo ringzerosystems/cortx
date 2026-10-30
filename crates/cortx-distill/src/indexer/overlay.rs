@@ -210,6 +210,24 @@ impl<'a> OverlayView<'a> {
         None
     }
 
+    /// Looks up declared symbol definitions for a file path, checking overlay first, then base.
+    pub fn get_file_defs<'b>(&'b self, target_path: &Path) -> Option<&'b [SymbolDef]> {
+        if let Some(defs) = self.overlay.and_then(|o| o.get_file_defs(target_path)) {
+            return Some(defs);
+        }
+        if !self.is_shadowed_path(target_path) {
+            return self.base.and_then(|b| b.get_file_defs(target_path));
+        }
+        None
+    }
+
+    /// Returns workspace root from overlay or base index.
+    pub fn workspace_root(&self) -> Option<&Path> {
+        self.overlay
+            .map(|o| o.manifests.workspace_root.as_path())
+            .or_else(|| self.base.map(|b| b.manifests.workspace_root.as_path()))
+    }
+
     /// Looks up symbol definitions, combining overlay and non-shadowed base entries.
     pub fn get_symbol_defs<'b>(&'b self, symbol: &str) -> Vec<&'b SymbolDef> {
         let mut defs = Vec::new();

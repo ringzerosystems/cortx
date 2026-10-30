@@ -22,8 +22,9 @@ pub use go_skeleton::{
     index_go_ast_with_options, is_go_test_function,
 };
 pub use indexer::{
-    CallEdge, CompactCallEdge, ContractInfo, CrossBoundaryImpact, RouteBinding, StringPool,
-    SymbolDef, SymbolId, SymbolIndex, SymbolIndexMetrics, WorkspaceManifests, is_ignored_path,
+    CallEdge, CompactCallEdge, ContractInfo, CrossBoundaryImpact, OverlayView, RouteBinding,
+    StringPool, SymbolDef, SymbolId, SymbolIndex, SymbolIndexMetrics, WorkspaceManifests,
+    is_ignored_path,
 };
 pub use skeleton::{
     SkeletonStripper, extract_file_skeleton, extract_file_skeleton_with_options, extract_skeleton,
@@ -36,8 +37,174 @@ pub use ts_skeleton::{
 };
 
 pub use cortx_core::model::DistillMode;
+pub use cortx_core::{ReadCoverage, ReadSpan};
 use std::collections::HashSet;
 use std::path::Path;
+
+/// Encapsulates parameters for a context distillation query.
+#[derive(Debug, Clone)]
+pub struct DistillQuery<'a> {
+    pub file_path: &'a Path,
+    pub mode: DistillMode,
+    pub coverage: ReadCoverage,
+    pub span: Option<ReadSpan>,
+    pub preloaded_source: Option<&'a str>,
+    pub cross_boundary: bool,
+    pub project_cfg: Option<&'a cortx_core::ProjectConfig>,
+}
+
+impl<'a> DistillQuery<'a> {
+    /// Creates a new query with default full file coverage.
+    pub fn new(file_path: &'a Path, mode: DistillMode) -> Self {
+        Self {
+            file_path,
+            mode,
+            coverage: ReadCoverage::FullFile,
+            span: None,
+            preloaded_source: None,
+            cross_boundary: false,
+            project_cfg: None,
+        }
+    }
+}
+
+/// Distills a target file or symbol using the provided query specification and overlay view.
+pub fn distill_with_query(
+    query: &DistillQuery<'_>,
+    view: OverlayView<'_>,
+) -> Result<DistillBundle, DistillError> {
+    if query.coverage == ReadCoverage::Micro {
+        return Ok(DistillBundle {
+            target: query.file_path.display().to_string(),
+            skeleton: String::new(),
+            contracts: Vec::new(),
+            callers: Vec::new(),
+            callees: Vec::new(),
+            token_reduction_pct: 0.0,
+            cross_boundary: None,
+            unread_outline: None,
+            omitted_callers: 0,
+            omitted_callees: 0,
+        });
+    }
+
+    let owned_source;
+    let raw_source = match query.preloaded_source {
+        Some(s) => s,
+        None => {
+            owned_source = std::fs::read_to_string(query.file_path).map_err(DistillError::Io)?;
+            &owned_source
+        }
+    };
+    let raw_len = raw_source.len().max(1);
+
+    let ext = query
+        .file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    let omit_tests = query.project_cfg.is_none_or(|p| p.distill.omit_tests);
+    let is_target_test = is_test_path(query.file_path);
+    let effective_omit_tests = if is_target_test { false } else { omit_tests };
+
+    let skeleton =
+        extract_source_skeleton(raw_source, ext, query.project_cfg, effective_omit_tests)?;
+    let skeleton_len = skeleton.len();
+
+    let reduction_pct = if raw_len > skeleton_len {
+        ((raw_len - skeleton_len) as f64 / raw_len as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let target_name = query
+        .file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("target");
+    let call_depth = query.project_cfg.map_or(2, |p| p.distill.max_call_depth);
+
+    let target_defs = view
+        .get_file_defs(query.file_path)
+        .map(|d| d.to_vec())
+        .unwrap_or_else(|| {
+            extract_defs_from_source(query.file_path, raw_source, ext, effective_omit_tests)
+        });
+
+    let mut contracts = Vec::new();
+    if matches!(query.mode, DistillMode::Contracts | DistillMode::Bundle) {
+        contracts = view.get_contracts(target_name);
+    }
+
+    let mut callers = Vec::new();
+    let mut callees = Vec::new();
+    let mut omitted_callers = 0;
+    let mut omitted_callees = 0;
+
+    let read_window = query
+        .span
+        .as_ref()
+        .and_then(|s| match (s.start_line, s.end_line) {
+            (Some(st), Some(en)) => Some((st, en)),
+            (Some(st), None) => Some((st, usize::MAX)),
+            (None, Some(en)) => Some((1, en)),
+            (None, None) => None,
+        });
+
+    if matches!(query.mode, DistillMode::Hierarchy | DistillMode::Bundle) {
+        let mut raw_callers =
+            collect_callers_view(&view, query.file_path, &target_defs, call_depth);
+        let mut raw_callees =
+            collect_callees_view(&view, query.file_path, &target_defs, call_depth);
+        if effective_omit_tests {
+            raw_callers.retain(|edge| !is_test_call_edge(edge));
+            raw_callees.retain(|edge| !is_test_call_edge(edge));
+        }
+
+        let ws_root = view.workspace_root();
+        normalize_edge_files(&mut raw_callers, ws_root);
+        normalize_edge_files(&mut raw_callees, ws_root);
+
+        let (ranked_callers, o_callers) =
+            rank_and_cap_callers(raw_callers, &target_defs, read_window);
+        let (ranked_callees, o_callees) =
+            rank_and_cap_callees(raw_callees, &target_defs, read_window);
+
+        callers = ranked_callers;
+        callees = ranked_callees;
+        omitted_callers = o_callers;
+        omitted_callees = o_callees;
+    }
+
+    let cross_boundary = if query.cross_boundary {
+        resolve_cross_boundary_view(&view, query.file_path, target_name)
+    } else {
+        None
+    };
+
+    let mut final_skeleton = skeleton;
+    let mut unread_outline = None;
+
+    if query.coverage == ReadCoverage::FullFile {
+        final_skeleton.clear();
+    } else if query.coverage == ReadCoverage::PartialMacro {
+        unread_outline = build_unread_outline(raw_source, &target_defs, read_window);
+    }
+
+    Ok(DistillBundle {
+        target: query.file_path.display().to_string(),
+        skeleton: final_skeleton,
+        contracts,
+        callers,
+        callees,
+        token_reduction_pct: reduction_pct,
+        cross_boundary,
+        unread_outline,
+        omitted_callers,
+        omitted_callees,
+    })
+}
 
 /// Distills a file or target symbol according to the requested DistillMode.
 pub fn distill_target(
@@ -68,90 +235,21 @@ pub fn distill_target_for_project(
     overlay_index: Option<&SymbolIndex>,
     project: Option<&cortx_core::ProjectConfig>,
 ) -> Result<DistillBundle, DistillError> {
-    let raw_source = std::fs::read_to_string(target_path).map_err(DistillError::Io)?;
-    let raw_len = raw_source.len().max(1);
-
-    let ext = target_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-
-    let omit_tests = project.is_none_or(|p| p.distill.omit_tests);
-    let is_target_test = is_test_path(target_path);
-    let effective_omit_tests = if is_target_test { false } else { omit_tests };
-
-    let skeleton = extract_source_skeleton(&raw_source, ext, project, effective_omit_tests)?;
-    let skeleton_len = skeleton.len();
-
-    let reduction_pct = if raw_len > skeleton_len {
-        ((raw_len - skeleton_len) as f64 / raw_len as f64) * 100.0
-    } else {
-        0.0
+    let view = OverlayView {
+        base: base_index,
+        overlay: overlay_index,
+        shadowed_files: None,
     };
-
-    let target_name = target_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("target");
-    let call_depth = project.map_or(2, |p| p.distill.max_call_depth);
-
-    let mut contracts = Vec::new();
-    let mut callers = Vec::new();
-    let mut callees = Vec::new();
-
-    if overlay_index.is_some() || base_index.is_some() {
-        if matches!(mode, DistillMode::Contracts | DistillMode::Bundle) {
-            let ov_contracts = overlay_index
-                .map(|idx| idx.get_contracts(target_name))
-                .unwrap_or_default();
-            contracts = if !ov_contracts.is_empty() {
-                ov_contracts
-            } else {
-                base_index
-                    .map(|idx| idx.get_contracts(target_name))
-                    .unwrap_or_default()
-            };
-        }
-        if matches!(mode, DistillMode::Hierarchy | DistillMode::Bundle) {
-            let ov_callers = overlay_index
-                .map(|idx| collect_callers(idx, target_path, call_depth, effective_omit_tests))
-                .unwrap_or_default();
-            callers = if !ov_callers.is_empty() {
-                ov_callers
-            } else {
-                base_index
-                    .map(|idx| collect_callers(idx, target_path, call_depth, effective_omit_tests))
-                    .unwrap_or_default()
-            };
-
-            let ov_callees = overlay_index
-                .map(|idx| collect_callees(idx, target_path, call_depth, effective_omit_tests))
-                .unwrap_or_default();
-            callees = if !ov_callees.is_empty() {
-                ov_callees
-            } else {
-                base_index
-                    .map(|idx| collect_callees(idx, target_path, call_depth, effective_omit_tests))
-                    .unwrap_or_default()
-            };
-        }
-    }
-
-    let cross_boundary = overlay_index
-        .and_then(|ov| resolve_cross_boundary(ov, target_path, target_name))
-        .or_else(|| {
-            base_index.and_then(|base| resolve_cross_boundary(base, target_path, target_name))
-        });
-
-    Ok(DistillBundle {
-        target: target_path.display().to_string(),
-        skeleton,
-        contracts,
-        callers,
-        callees,
-        token_reduction_pct: reduction_pct,
-        cross_boundary,
-    })
+    let query = DistillQuery {
+        file_path: target_path,
+        mode,
+        coverage: ReadCoverage::PartialMacro,
+        span: None,
+        preloaded_source: None,
+        cross_boundary: true,
+        project_cfg: project,
+    };
+    distill_with_query(&query, view)
 }
 
 fn extract_source_skeleton(
@@ -191,9 +289,11 @@ pub(crate) fn is_test_path(path: &Path) -> bool {
 }
 
 fn is_test_symbol(sym: &str) -> bool {
-    let leaf = sym.rsplit("::").next().unwrap_or(sym);
+    let leaf = sym.rsplit([':', '.']).next().unwrap_or(sym);
     sym.starts_with("tests::")
+        || sym.starts_with("tests.")
         || sym.contains("::tests::")
+        || sym.contains(".tests.")
         || is_go_test_function(leaf)
         || leaf.starts_with("test_")
         || leaf.starts_with("bench_")
@@ -209,50 +309,373 @@ pub(crate) fn path_matches(p1: &Path, p2: &Path) -> bool {
     p1 == p2 || p1.ends_with(p2) || p2.ends_with(p1)
 }
 
-fn collect_callers(
-    idx: &SymbolIndex,
+fn collect_callers_view(
+    view: &OverlayView<'_>,
     target_path: &Path,
+    target_defs: &[SymbolDef],
     depth: usize,
-    omit_tests: bool,
 ) -> Vec<CallEdge> {
     let target_name = target_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("target");
-    let mut callers = idx.get_callers(target_name, depth);
-    let mut seen: HashSet<CallEdge> = callers.iter().cloned().collect();
-    if let Some(sym_names) = idx.get_file_symbols(target_path) {
+    let mut callers = Vec::new();
+    let mut seen = HashSet::new();
+    view.collect_callers_into(target_name, depth, &mut callers, &mut seen);
+    if let Some(sym_names) = view.get_file_symbols(target_path) {
         for sym in sym_names {
-            idx.collect_callers_into(sym, depth, &mut callers, &mut seen);
+            view.collect_callers_into(sym, depth, &mut callers, &mut seen);
         }
     }
-    if omit_tests {
-        callers.retain(|edge| !is_test_call_edge(edge));
+    for def in target_defs {
+        if !def.name.is_empty() {
+            view.collect_callers_into(&def.name, depth, &mut callers, &mut seen);
+        }
+        if !def.qualified_name.is_empty() && def.qualified_name != def.name {
+            view.collect_callers_into(&def.qualified_name, depth, &mut callers, &mut seen);
+        }
     }
     callers
 }
 
-fn collect_callees(
-    idx: &SymbolIndex,
+fn collect_callees_view(
+    view: &OverlayView<'_>,
     target_path: &Path,
+    target_defs: &[SymbolDef],
     depth: usize,
-    omit_tests: bool,
 ) -> Vec<CallEdge> {
     let target_name = target_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("target");
-    let mut callees = idx.get_callees(target_name, depth);
-    let mut seen: HashSet<CallEdge> = callees.iter().cloned().collect();
-    if let Some(sym_names) = idx.get_file_symbols(target_path) {
+    let mut callees = Vec::new();
+    let mut seen = HashSet::new();
+    view.collect_callees_into(target_name, depth, &mut callees, &mut seen);
+    if let Some(sym_names) = view.get_file_symbols(target_path) {
         for sym in sym_names {
-            idx.collect_callees_into(sym, depth, &mut callees, &mut seen);
+            view.collect_callees_into(sym, depth, &mut callees, &mut seen);
         }
     }
-    if omit_tests {
-        callees.retain(|edge| !is_test_call_edge(edge));
+    for def in target_defs {
+        if !def.name.is_empty() {
+            view.collect_callees_into(&def.name, depth, &mut callees, &mut seen);
+        }
+        if !def.qualified_name.is_empty() && def.qualified_name != def.name {
+            view.collect_callees_into(&def.qualified_name, depth, &mut callees, &mut seen);
+        }
     }
     callees
+}
+
+fn normalize_edge_files(edges: &mut [CallEdge], ws_root: Option<&Path>) {
+    for edge in edges {
+        let p = Path::new(&edge.file);
+        if let Some(root) = ws_root {
+            if let Ok(rel) = p.strip_prefix(root) {
+                edge.file = rel.to_string_lossy().to_string();
+                continue;
+            }
+        }
+        if let Ok(rel) = p.strip_prefix("./") {
+            edge.file = rel.to_string_lossy().to_string();
+        }
+    }
+}
+
+fn distance_to_window(
+    anchor_start: usize,
+    anchor_end: usize,
+    window: Option<(usize, usize)>,
+) -> usize {
+    let Some((w_start, w_end)) = window else {
+        return 0;
+    };
+    if anchor_start == 0 {
+        return usize::MAX;
+    }
+    if anchor_end < w_start {
+        w_start - anchor_end
+    } else {
+        anchor_start.saturating_sub(w_end)
+    }
+}
+
+fn rank_and_cap_callers(
+    mut callers: Vec<CallEdge>,
+    target_defs: &[SymbolDef],
+    read_window: Option<(usize, usize)>,
+) -> (Vec<CallEdge>, usize) {
+    callers.sort_by(|a, b| {
+        let key_a = caller_sort_key(a, target_defs, read_window);
+        let key_b = caller_sort_key(b, target_defs, read_window);
+        key_a.cmp(&key_b)
+    });
+
+    let omitted = if callers.len() > 32 {
+        let count = callers.len() - 32;
+        callers.truncate(32);
+        count
+    } else {
+        0
+    };
+    (callers, omitted)
+}
+
+fn caller_sort_key<'a>(
+    edge: &'a CallEdge,
+    target_defs: &[SymbolDef],
+    read_window: Option<(usize, usize)>,
+) -> (usize, usize, &'a str, usize, &'a str, &'a str) {
+    let def_match = target_defs.iter().find(|d| {
+        d.name == edge.callee
+            || d.qualified_name == edge.callee
+            || edge.callee.ends_with(&format!("::{}", d.name))
+            || edge.callee.ends_with(&format!(".{}", d.name))
+    });
+
+    let (hop_depth, anchor) = match def_match {
+        Some(d) => (
+            1,
+            (
+                d.line,
+                if d.end_line >= d.line {
+                    d.end_line
+                } else {
+                    d.line
+                },
+            ),
+        ),
+        None => (2, (0, 0)),
+    };
+
+    let dist = if anchor.0 == 0 {
+        usize::MAX
+    } else {
+        distance_to_window(anchor.0, anchor.1, read_window)
+    };
+
+    let effective_call_line = if edge.call_line == 0 {
+        usize::MAX
+    } else {
+        edge.call_line
+    };
+
+    (
+        hop_depth,
+        dist,
+        edge.file.as_str(),
+        effective_call_line,
+        edge.caller.as_str(),
+        edge.callee.as_str(),
+    )
+}
+
+fn rank_and_cap_callees(
+    mut callees: Vec<CallEdge>,
+    target_defs: &[SymbolDef],
+    read_window: Option<(usize, usize)>,
+) -> (Vec<CallEdge>, usize) {
+    let hop1_seeds: std::collections::HashMap<String, usize> = callees
+        .iter()
+        .filter(|e| {
+            target_defs.iter().any(|d| {
+                d.name == e.caller
+                    || d.qualified_name == e.caller
+                    || e.caller.ends_with(&format!("::{}", d.name))
+                    || e.caller.ends_with(&format!(".{}", d.name))
+            })
+        })
+        .map(|e| (e.callee.clone(), e.call_line))
+        .collect();
+
+    callees.sort_by(|a, b| {
+        let key_a = callee_sort_key(a, target_defs, &hop1_seeds, read_window);
+        let key_b = callee_sort_key(b, target_defs, &hop1_seeds, read_window);
+        key_a.cmp(&key_b)
+    });
+
+    let omitted = if callees.len() > 32 {
+        let count = callees.len() - 32;
+        callees.truncate(32);
+        count
+    } else {
+        0
+    };
+    (callees, omitted)
+}
+
+fn callee_sort_key<'a>(
+    edge: &'a CallEdge,
+    target_defs: &[SymbolDef],
+    hop1_seeds: &std::collections::HashMap<String, usize>,
+    read_window: Option<(usize, usize)>,
+) -> (usize, usize, &'a str, usize, &'a str, &'a str) {
+    let is_hop1 = target_defs.iter().any(|d| {
+        d.name == edge.caller
+            || d.qualified_name == edge.caller
+            || edge.caller.ends_with(&format!("::{}", d.name))
+            || edge.caller.ends_with(&format!(".{}", d.name))
+    });
+
+    let (hop_depth, anchor_line) = if is_hop1 {
+        (1, edge.call_line)
+    } else {
+        let inherited = hop1_seeds.get(edge.caller.as_str()).copied().unwrap_or(0);
+        (2, inherited)
+    };
+
+    let dist = if anchor_line == 0 {
+        usize::MAX
+    } else {
+        distance_to_window(anchor_line, anchor_line, read_window)
+    };
+
+    let effective_call_line = if edge.call_line == 0 {
+        usize::MAX
+    } else {
+        edge.call_line
+    };
+
+    (
+        hop_depth,
+        dist,
+        edge.file.as_str(),
+        effective_call_line,
+        edge.caller.as_str(),
+        edge.callee.as_str(),
+    )
+}
+
+fn extract_defs_from_source(
+    target_path: &Path,
+    raw_source: &str,
+    ext: &str,
+    omit_tests: bool,
+) -> Vec<SymbolDef> {
+    if matches!(ext, "ts" | "tsx" | "js" | "jsx") {
+        let opts = indexer::ts_graph::TsFactOptions {
+            file_path: target_path,
+            rel_path: target_path,
+            package_name: None,
+            omit_tests,
+        };
+        indexer::ts_graph::extract_ts_file_facts(&opts, raw_source)
+            .map(|f| f.symbols)
+            .unwrap_or_default()
+    } else if ext == "go" {
+        let opts = indexer::go_graph::GoFactOptions {
+            file_path: target_path,
+            rel_path: target_path,
+            package_path: None,
+            omit_tests,
+        };
+        indexer::go_graph::extract_go_file_facts(&opts, raw_source)
+            .map(|f| f.symbols)
+            .unwrap_or_default()
+    } else if ext == "rs" {
+        let opts = indexer::rust_graph::RustFactOptions {
+            file_path: target_path,
+            rel_path: target_path,
+            crate_name: "",
+            omit_tests,
+        };
+        indexer::rust_graph::extract_rust_file_facts(&opts, raw_source)
+            .map(|f| f.symbols)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Slices the declaration signature directly from `source` starting at line `line` (1-indexed),
+/// bounded to at most 40 lines.
+pub fn extract_symbol_signature(source: &str, line: usize) -> &str {
+    if line == 0 {
+        return "";
+    }
+    let mut current_line = 1;
+    let mut start_idx = None;
+    for (idx, ch) in source.char_indices() {
+        if current_line == line {
+            start_idx = Some(idx);
+            break;
+        }
+        if ch == '\n' {
+            current_line += 1;
+        }
+    }
+    let Some(start) = start_idx else {
+        return "";
+    };
+
+    let remainder = &source[start..];
+    let mut line_count = 0;
+    let mut end_offset = remainder.len();
+    let mut paren_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
+
+    for (rel_idx, ch) in remainder.char_indices() {
+        if ch == '\n' {
+            line_count += 1;
+            if line_count >= 40 {
+                end_offset = rel_idx;
+                break;
+            }
+        }
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' if paren_depth == 0 && bracket_depth == 0 => {
+                end_offset = rel_idx;
+                break;
+            }
+            ';' if paren_depth == 0 && bracket_depth == 0 => {
+                end_offset = rel_idx;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    remainder[..end_offset].trim()
+}
+
+fn build_unread_outline(
+    raw_source: &str,
+    target_defs: &[SymbolDef],
+    window: Option<(usize, usize)>,
+) -> Option<String> {
+    let (start_l, end_l) = window?;
+    let mut unread_defs: Vec<&SymbolDef> = target_defs
+        .iter()
+        .filter(|d| {
+            let d_end = if d.end_line >= d.line {
+                d.end_line
+            } else {
+                d.line
+            };
+            d.line > 0 && (d_end < start_l || d.line > end_l)
+        })
+        .collect();
+
+    unread_defs.sort_by_key(|d| d.line);
+    unread_defs.dedup_by_key(|d| d.line);
+
+    let mut outline = String::new();
+    for def in unread_defs {
+        let sig = extract_symbol_signature(raw_source, def.line);
+        if !sig.is_empty() {
+            outline.push_str(&format!("L{}: {}\n", def.line, sig));
+        }
+    }
+
+    if outline.is_empty() {
+        None
+    } else {
+        Some(outline)
+    }
 }
 
 fn def_matches_path(def_opt: &Option<String>, target_path: &Path) -> bool {
@@ -288,8 +711,8 @@ fn is_valid_cross_boundary(cb: &CrossBoundaryImpact, target_path: &Path) -> bool
     (has_valid_backend && has_valid_ts) || !cb.api_call_sites.is_empty()
 }
 
-fn resolve_cross_boundary(
-    idx: &SymbolIndex,
+fn resolve_cross_boundary_view(
+    view: &OverlayView<'_>,
     target_path: &Path,
     target_name: &str,
 ) -> Option<CrossBoundaryImpact> {
@@ -301,20 +724,20 @@ fn resolve_cross_boundary(
         .trim_end_matches(".js")
         .trim_end_matches(".go");
 
-    if let Some(cb) = idx.get_cross_boundary_impact(sym_stem) {
+    if let Some(cb) = view.get_cross_boundary_impact(sym_stem) {
         if is_valid_cross_boundary(&cb, target_path) {
             return Some(cb);
         }
     }
-    if let Some(cb) = idx.get_cross_boundary_impact(target_name) {
+    if let Some(cb) = view.get_cross_boundary_impact(target_name) {
         if is_valid_cross_boundary(&cb, target_path) {
             return Some(cb);
         }
     }
 
-    if let Some(sym_names) = idx.get_file_symbols(target_path) {
+    if let Some(sym_names) = view.get_file_symbols(target_path) {
         for sym_name in sym_names {
-            if let Some(cb) = idx.get_cross_boundary_impact(sym_name) {
+            if let Some(cb) = view.get_cross_boundary_impact(sym_name) {
                 if is_valid_cross_boundary(&cb, target_path) {
                     return Some(cb);
                 }
@@ -382,7 +805,7 @@ mod tests {
         );
         let md = bundle.format_markdown();
         assert!(md.contains("```typescript"));
-        assert!(md.contains("Token Reduction:"));
+        assert!(bundle.token_reduction_pct > 0.0);
     }
 
     #[test]
@@ -452,7 +875,7 @@ mod tests {
 
         let md = bundle.format_markdown();
         assert!(md.contains("```go"));
-        assert!(md.contains("Token Reduction:"));
+        assert!(bundle.token_reduction_pct > 0.0);
         assert!(md.contains("## Cross-Boundary Impact"));
         assert!(md.contains("Go Backend Model:"));
     }
@@ -916,5 +1339,201 @@ mod tests {
 
         let bundle = distill_target(&test_file, DistillMode::Bundle, None).unwrap();
         assert!(bundle.skeleton.contains("fn it_works()"));
+    }
+
+    #[test]
+    fn test_extract_symbol_signature_polyglot() {
+        let rust_src = "pub fn run(&self) {\n    println!(\"hi\");\n}\npub fn multi(\n    a: i32,\n) -> i32 {\n    a\n}";
+        assert_eq!(extract_symbol_signature(rust_src, 1), "pub fn run(&self)");
+        assert_eq!(
+            extract_symbol_signature(rust_src, 4),
+            "pub fn multi(\n    a: i32,\n) -> i32"
+        );
+        assert_eq!(extract_symbol_signature(rust_src, 0), "");
+        assert_eq!(extract_symbol_signature(rust_src, 99), "");
+
+        let ts_src = "export async function fetchData(url: string): Promise<Response> {\n    return fetch(url);\n}\nexport function opt(opts: { flag: boolean }): void {\n}";
+        assert_eq!(
+            extract_symbol_signature(ts_src, 1),
+            "export async function fetchData(url: string): Promise<Response>"
+        );
+        assert_eq!(
+            extract_symbol_signature(ts_src, 4),
+            "export function opt(opts: { flag: boolean }): void"
+        );
+
+        let go_src = "func (s *Service) Run(ctx context.Context) error {\n    return nil\n}";
+        assert_eq!(
+            extract_symbol_signature(go_src, 1),
+            "func (s *Service) Run(ctx context.Context) error"
+        );
+    }
+
+    #[test]
+    fn test_is_test_symbol_polyglot() {
+        assert!(is_test_symbol("my_crate::tests::test_foo"));
+        assert!(is_test_symbol("my_crate::foo::tests::bar"));
+        assert!(is_test_symbol("test_handler"));
+        assert!(is_test_symbol("bench_handler"));
+        assert!(is_test_symbol("github.com/org/pkg.TestProcess"));
+        assert!(is_test_symbol("github.com/org/pkg.BenchmarkProcess"));
+
+        assert!(!is_test_symbol("my_crate::service::process"));
+        assert!(!is_test_symbol("github.com/org/pkg.Process"));
+        assert!(!is_test_symbol("UserHandler"));
+    }
+
+    #[test]
+    fn test_distill_with_query_full_file_omits_skeleton() {
+        let dir = tempfile::tempdir().unwrap();
+        let rs_path = dir.path().join("leaf.rs");
+        std::fs::write(&rs_path, "pub fn leaf() {}").unwrap();
+
+        let query = DistillQuery {
+            file_path: &rs_path,
+            mode: DistillMode::Bundle,
+            coverage: ReadCoverage::FullFile,
+            span: None,
+            preloaded_source: None,
+            cross_boundary: false,
+            project_cfg: None,
+        };
+
+        let bundle = distill_with_query(&query, OverlayView::empty()).unwrap();
+        assert!(bundle.skeleton.is_empty());
+        assert!(bundle.is_empty());
+        assert_eq!(bundle.format_markdown(), "");
+        assert_eq!(bundle.format_text(), "");
+    }
+
+    #[test]
+    fn test_distill_with_query_partial_macro_unread_outline() {
+        let dir = tempfile::tempdir().unwrap();
+        let rs_path = dir.path().join("multi.rs");
+        let src = r#"pub fn head() {
+    println!("1");
+}
+
+pub fn mid() {
+    println!("2");
+}
+
+pub fn tail() {
+    println!("3");
+}
+"#;
+        std::fs::write(&rs_path, src).unwrap();
+
+        let mut idx = SymbolIndex::new();
+        idx.index_any_source_str(&rs_path.to_string_lossy(), src)
+            .unwrap();
+        let view = OverlayView {
+            base: Some(&idx),
+            overlay: None,
+            shadowed_files: None,
+        };
+
+        let span = ReadSpan {
+            start_line: Some(5),
+            end_line: Some(8),
+            ..Default::default()
+        };
+
+        let query = DistillQuery {
+            file_path: &rs_path,
+            mode: DistillMode::Bundle,
+            coverage: ReadCoverage::PartialMacro,
+            span: Some(span),
+            preloaded_source: None,
+            cross_boundary: false,
+            project_cfg: None,
+        };
+
+        let bundle = distill_with_query(&query, view).unwrap();
+        assert!(!bundle.skeleton.is_empty());
+        let outline = bundle.unread_outline.expect("outline should be generated");
+        assert!(outline.contains("L1: pub fn head()"));
+        assert!(outline.contains("L9: pub fn tail()"));
+        assert!(!outline.contains("mid"));
+    }
+
+    #[test]
+    fn test_distill_with_query_proximity_ranking() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc_path = dir.path().join("service.rs");
+        let caller1_path = dir.path().join("caller1.rs");
+        let caller2_path = dir.path().join("caller2.rs");
+
+        let src = r#"pub fn alpha() {}
+
+pub fn omega() {}
+"#;
+        std::fs::write(&svc_path, src).unwrap();
+
+        let mut idx = SymbolIndex::new();
+        idx.index_any_source_str(&svc_path.to_string_lossy(), src)
+            .unwrap();
+        idx.add_call_edge(CallEdge {
+            caller: "call_alpha".into(),
+            callee: "alpha".into(),
+            file: caller1_path.to_string_lossy().to_string(),
+            call_line: 10,
+        });
+        idx.add_call_edge(CallEdge {
+            caller: "call_omega".into(),
+            callee: "omega".into(),
+            file: caller2_path.to_string_lossy().to_string(),
+            call_line: 20,
+        });
+
+        let view = OverlayView {
+            base: Some(&idx),
+            overlay: None,
+            shadowed_files: None,
+        };
+
+        // Window close to omega (line 3)
+        let span = ReadSpan {
+            start_line: Some(3),
+            end_line: Some(5),
+            ..Default::default()
+        };
+
+        let query = DistillQuery {
+            file_path: &svc_path,
+            mode: DistillMode::Bundle,
+            coverage: ReadCoverage::PartialMacro,
+            span: Some(span),
+            preloaded_source: None,
+            cross_boundary: false,
+            project_cfg: None,
+        };
+
+        let bundle = distill_with_query(&query, view).unwrap();
+        assert_eq!(bundle.callers.len(), 2);
+        // call_omega should be ranked first because omega is at line 3, inside the read window
+        assert_eq!(bundle.callers[0].callee, "omega");
+        assert_eq!(bundle.callers[1].callee, "alpha");
+    }
+
+    #[test]
+    fn test_distill_with_query_micro_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let rs_path = dir.path().join("file.rs");
+        std::fs::write(&rs_path, "pub fn foo() {}").unwrap();
+
+        let query = DistillQuery {
+            file_path: &rs_path,
+            mode: DistillMode::Bundle,
+            coverage: ReadCoverage::Micro,
+            span: None,
+            preloaded_source: None,
+            cross_boundary: false,
+            project_cfg: None,
+        };
+
+        let bundle = distill_with_query(&query, OverlayView::empty()).unwrap();
+        assert!(bundle.is_empty());
+        assert_eq!(bundle.format_markdown(), "");
     }
 }

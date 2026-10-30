@@ -997,6 +997,9 @@ mod tests {
             callees: vec![],
             token_reduction_pct: 50.0,
             cross_boundary: None,
+            unread_outline: None,
+            omitted_callers: 0,
+            omitted_callees: 0,
         };
 
         let full_md = bundle.format_markdown();

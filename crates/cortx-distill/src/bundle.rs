@@ -62,9 +62,29 @@ pub struct DistillBundle {
     /// Cross-boundary contract impact between Rust backend and TypeScript frontend.
     #[serde(default)]
     pub cross_boundary: Option<CrossBoundaryImpact>,
+    /// Compact outline of unread declarations outside the read window (PartialMacro).
+    #[serde(default)]
+    pub unread_outline: Option<String>,
+    /// Number of upstream callers omitted due to per-section or budget ceilings.
+    #[serde(default)]
+    pub omitted_callers: usize,
+    /// Number of downstream callees omitted due to per-section or budget ceilings.
+    #[serde(default)]
+    pub omitted_callees: usize,
 }
 
 impl DistillBundle {
+    /// Returns true if all packed sections (skeleton, contracts, callers, callees, cross-boundary, outline) are empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.skeleton.is_empty()
+            && self.contracts.is_empty()
+            && self.callers.is_empty()
+            && self.callees.is_empty()
+            && self.cross_boundary.is_none()
+            && self.unread_outline.as_deref().unwrap_or("").is_empty()
+    }
+
     /// Returns a copy of the distill bundle with upstream callers and downstream dependencies stripped.
     ///
     /// Retains the type skeleton, trait contracts, and cross-boundary impact while zeroing
@@ -80,6 +100,9 @@ impl DistillBundle {
             callees: Vec::new(),
             token_reduction_pct: self.token_reduction_pct,
             cross_boundary: self.cross_boundary.clone(),
+            unread_outline: self.unread_outline.clone(),
+            omitted_callers: 0,
+            omitted_callees: 0,
         }
     }
 
@@ -160,6 +183,9 @@ impl DistillBundle {
 
     /// Emits structured markdown optimized for LLM system prompt context injection.
     pub fn format_markdown(&self) -> String {
+        if self.is_empty() {
+            return String::new();
+        }
         let mut out = String::new();
         out.push_str(&format!(
             "# Cortx Context Distillation: `{}`\n\n",
@@ -248,6 +274,9 @@ impl DistillBundle {
 
     /// Emits plain-text representation.
     pub fn format_text(&self) -> String {
+        if self.is_empty() {
+            return String::new();
+        }
         let mut out = String::new();
         out.push_str(&format!(
             "=== Cortx Context Distillation: {} (Reduction: {:.1}%) ===\n\n",
@@ -350,6 +379,9 @@ mod tests {
                 go_definition: None,
                 api_call_sites: vec!["fetch('/api/users')".to_string()],
             }),
+            unread_outline: None,
+            omitted_callers: 0,
+            omitted_callees: 0,
         };
 
         let full_md = bundle.format_markdown();
@@ -406,6 +438,9 @@ mod tests {
             callees: vec![],
             token_reduction_pct: 50.0,
             cross_boundary: None,
+            unread_outline: None,
+            omitted_callers: 0,
+            omitted_callees: 0,
         };
 
         // Zero budget: immediate drop, full_len is None
@@ -446,6 +481,9 @@ mod tests {
             callees: vec![],
             token_reduction_pct: 50.0,
             cross_boundary: None,
+            unread_outline: None,
+            omitted_callers: 0,
+            omitted_callees: 0,
         };
 
         let pruned_len = bundle.without_call_graph().format_markdown().len() as u64;
@@ -533,6 +571,9 @@ mod tests {
                 callees,
                 token_reduction_pct: 50.0,
                 cross_boundary: None,
+                unread_outline: None,
+                omitted_callers: 0,
+                omitted_callees: 0,
             };
 
             let budgeted = bundle.fit_to_budget(raw_len);

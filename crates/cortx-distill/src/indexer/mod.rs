@@ -1200,6 +1200,31 @@ impl SymbolIndex {
         })
     }
 
+    pub fn get_file_defs<'a>(&'a self, target_path: &Path) -> Option<&'a [SymbolDef]> {
+        if let Some(defs) = self.file_symbols.get(target_path) {
+            return Some(defs.as_slice());
+        }
+        let target_file_name = target_path.file_name()?.to_str()?;
+        if let Some(candidates) = self.file_name_to_paths.get(target_file_name) {
+            for candidate in candidates {
+                if crate::path_matches(target_path, Path::new(candidate)) {
+                    if let Some(defs) = self.file_symbols.get(Path::new(candidate)) {
+                        return Some(defs.as_slice());
+                    }
+                }
+            }
+        }
+        self.file_symbols.iter().find_map(|(p, defs)| {
+            if p.file_name().and_then(|n| n.to_str()) == Some(target_file_name)
+                && crate::path_matches(target_path, p)
+            {
+                Some(defs.as_slice())
+            } else {
+                None
+            }
+        })
+    }
+
     fn collect_edges_bfs(
         &self,
         map: &HashMap<SymbolId, Vec<CompactCallEdge>>,
