@@ -600,16 +600,19 @@ fn test_collect_callers_and_callees_equivalence_and_dedup() {
         caller: "caller_a".into(),
         callee: "entrypoint".into(),
         file: "/project/src/caller_a.rs".into(),
+        call_line: 0,
     };
     let edge_b = CallEdge {
         caller: "caller_b".into(),
         callee: "helper".into(),
         file: "/project/src/caller_b.rs".into(),
+        call_line: 0,
     };
     let edge_shared = CallEdge {
         caller: "caller_shared".into(),
         callee: "helper".into(),
         file: "/project/src/caller_shared.rs".into(),
+        call_line: 0,
     };
 
     // Add callers
@@ -619,16 +622,19 @@ fn test_collect_callers_and_callees_equivalence_and_dedup() {
         caller: idx.pool.intern(&edge_a.caller),
         callee: idx.pool.intern(&edge_a.callee),
         file: idx.pool.intern(&edge_a.file),
+        call_line: 0,
     };
     let c_edge_b = CompactCallEdge {
         caller: idx.pool.intern(&edge_b.caller),
         callee: idx.pool.intern(&edge_b.callee),
         file: idx.pool.intern(&edge_b.file),
+        call_line: 0,
     };
     let c_edge_shared = CompactCallEdge {
         caller: idx.pool.intern(&edge_shared.caller),
         callee: idx.pool.intern(&edge_shared.callee),
         file: idx.pool.intern(&edge_shared.file),
+        call_line: 0,
     };
 
     idx.callers_map
@@ -706,12 +712,13 @@ fn test_string_pool() {
     assert_eq!(pool.len(), 2);
     assert!(!pool.is_empty());
 
-    // Verify CompactCallEdge size is exactly 12 bytes
-    assert_eq!(std::mem::size_of::<CompactCallEdge>(), 12);
+    // Verify CompactCallEdge size is exactly 16 bytes
+    assert_eq!(std::mem::size_of::<CompactCallEdge>(), 16);
     let edge = CompactCallEdge {
         caller: id_a,
         callee: id_c,
         file: id_a,
+        call_line: 0,
     };
     assert_eq!(edge.caller, id_a);
     assert_eq!(edge.callee, id_c);
@@ -726,16 +733,19 @@ fn test_call_edge_fidelity_cycles_overlay_and_parallel_merge() {
         caller: "node_a".to_string(),
         callee: "node_b".to_string(),
         file: "src/file_a.rs".to_string(),
+        call_line: 0,
     };
     let edge_bc = CallEdge {
         caller: "node_b".to_string(),
         callee: "node_c".to_string(),
         file: "src/file_b.rs".to_string(),
+        call_line: 0,
     };
     let edge_ca = CallEdge {
         caller: "node_c".to_string(),
         callee: "node_a".to_string(),
         file: "src/file_c.rs".to_string(),
+        call_line: 0,
     };
 
     idx_cycle.add_call_edge(edge_ab.clone());
@@ -762,6 +772,7 @@ fn test_call_edge_fidelity_cycles_overlay_and_parallel_merge() {
         caller: "fn_base_caller".to_string(),
         callee: "fn_shared".to_string(),
         file: "src/base.rs".to_string(),
+        call_line: 0,
     };
     base_idx.add_call_edge(base_edge.clone());
 
@@ -770,6 +781,7 @@ fn test_call_edge_fidelity_cycles_overlay_and_parallel_merge() {
         caller: "fn_overlay_caller".to_string(),
         callee: "fn_overlay_target".to_string(),
         file: "src/overlay.rs".to_string(),
+        call_line: 0,
     };
     overlay_idx.add_call_edge(overlay_edge.clone());
 
@@ -792,11 +804,13 @@ fn test_call_edge_fidelity_cycles_overlay_and_parallel_merge() {
         caller: "caller_x".to_string(),
         callee: "common_fn".to_string(),
         file: "src/x.rs".to_string(),
+        call_line: 0,
     };
     let edge_leaf1 = CallEdge {
         caller: "common_fn".to_string(),
         callee: "leaf_1".to_string(),
         file: "src/x.rs".to_string(),
+        call_line: 0,
     };
     idx1.add_call_edge(edge_x.clone());
     idx1.add_call_edge(edge_leaf1.clone());
@@ -806,11 +820,13 @@ fn test_call_edge_fidelity_cycles_overlay_and_parallel_merge() {
         caller: "caller_y".to_string(),
         callee: "common_fn".to_string(),
         file: "src/y.rs".to_string(),
+        call_line: 0,
     };
     let edge_leaf2 = CallEdge {
         caller: "common_fn".to_string(),
         callee: "leaf_2".to_string(),
         file: "src/y.rs".to_string(),
+        call_line: 0,
     };
     idx2.add_call_edge(edge_y.clone());
     idx2.add_call_edge(edge_leaf2.clone());

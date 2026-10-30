@@ -992,6 +992,7 @@ mod tests {
                 caller: "caller_fn".into(),
                 callee: "small".into(),
                 file: "src/caller.rs".into(),
+                call_line: 0,
             }],
             callees: vec![],
             token_reduction_pct: 50.0,

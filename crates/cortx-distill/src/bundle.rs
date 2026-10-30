@@ -334,11 +334,13 @@ mod tests {
                 caller: "handle_request".to_string(),
                 callee: "UserService::find_user".to_string(),
                 file: "src/handler.rs".to_string(),
+                call_line: 0,
             }],
             callees: vec![CallEdge {
                 caller: "UserService::find_user".to_string(),
                 callee: "db_query".to_string(),
                 file: "src/service.rs".to_string(),
+                call_line: 0,
             }],
             token_reduction_pct: 72.5,
             cross_boundary: Some(CrossBoundaryImpact {
@@ -399,6 +401,7 @@ mod tests {
                 caller: "caller_fn".into(),
                 callee: "S".into(),
                 file: "src/caller.rs".into(),
+                call_line: 0,
             }],
             callees: vec![],
             token_reduction_pct: 50.0,
@@ -432,6 +435,7 @@ mod tests {
                 caller: format!("caller_{i}"),
                 callee: "S".into(),
                 file: format!("src/caller_{i}.rs"),
+                call_line: 0,
             })
             .collect();
         let bundle = DistillBundle {
@@ -509,6 +513,7 @@ mod tests {
                     caller: format!("caller_{i}"),
                     callee: "fn_callee".into(),
                     file: "caller.rs".into(),
+                    call_line: 0,
                 })
                 .collect();
             let callees = (0..callee_count)
@@ -516,6 +521,7 @@ mod tests {
                     caller: "fn_callee".into(),
                     callee: format!("callee_{i}"),
                     file: "callee.rs".into(),
+                    call_line: 0,
                 })
                 .collect();
 
