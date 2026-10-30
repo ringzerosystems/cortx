@@ -23,7 +23,7 @@ pub use go_skeleton::{
 };
 pub use indexer::{
     CallEdge, CompactCallEdge, ContractInfo, CrossBoundaryImpact, RouteBinding, StringPool,
-    SymbolDef, SymbolId, SymbolIndex, SymbolIndexMetrics, is_ignored_path,
+    SymbolDef, SymbolId, SymbolIndex, SymbolIndexMetrics, WorkspaceManifests, is_ignored_path,
 };
 pub use skeleton::{
     SkeletonStripper, extract_file_skeleton, extract_file_skeleton_with_options, extract_skeleton,

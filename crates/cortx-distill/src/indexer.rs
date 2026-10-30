@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 use walkdir::WalkDir;
 
+pub mod manifests;
 pub mod pool;
+pub use manifests::WorkspaceManifests;
 pub use pool::{CallEdge, CompactCallEdge, StringPool, SymbolId};
 
 /// Information describing a trait contract implementation (`impl Trait for Target`).
