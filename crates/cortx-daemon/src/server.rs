@@ -4,7 +4,8 @@ use crate::error::DaemonError;
 use crate::hook::{execute_post_read_bundle, execute_post_read_bundle_for_project};
 use crate::logging::DaemonLogManager;
 use crate::protocol::{
-    DaemonRequest, DaemonResponse, DaemonStatusInfo, WorkspaceSummary, read_message, write_message,
+    DaemonRequest, DaemonResponse, DaemonStatusInfo, PROTOCOL_VERSION, WorkspaceSummary,
+    read_message, write_message,
 };
 use crate::registry::{WorkspaceEntry, WorkspaceRegistry};
 use crate::watcher::DynamicWatcherManager;
@@ -566,6 +567,7 @@ async fn handle_post_read_request(
             DaemonResponse::AdvisoryContext {
                 file: file.display().to_string(),
                 advisory_block: outcome.markdown,
+                protocol_version: PROTOCOL_VERSION,
             }
         }
         Err(e) => {
@@ -708,6 +710,10 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
             ast_drops: entry.ast_drops(),
             macro_reads: entry.macro_reads(),
             micro_reads: entry.micro_reads(),
+            omitted_micro_reads: 0,
+            omitted_full_read_skeletons: 0,
+            trimmed_advisories: 0,
+            parse_fallbacks: 0,
         });
     }
 
@@ -730,6 +736,8 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
     let (hooks, raw, delivered, saved, pct, est_tokens) = state.telemetry.snapshot();
     let supp_tokens = delivered / cortx_core::span::EST_BYTES_PER_TOKEN;
     DaemonStatusInfo {
+        protocol_version: PROTOCOL_VERSION,
+        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
         uptime_secs: state.start_time.elapsed().as_secs(),
         socket_path: state.options.socket_path.clone(),
@@ -758,6 +766,10 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
         est_tokens_saved: est_tokens,
         macro_reads: state.telemetry.macro_reads.load(Ordering::Relaxed),
         micro_reads: state.telemetry.micro_reads.load(Ordering::Relaxed),
+        omitted_micro_reads: 0,
+        omitted_full_read_skeletons: 0,
+        trimmed_advisories: 0,
+        parse_fallbacks: 0,
         supplemental_context_bytes: delivered,
         supplemental_context_tokens: supp_tokens,
     }
@@ -791,6 +803,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Resul
                 end_line,
                 raw_read_bytes,
                 read_kind,
+                ..
             } => {
                 let params = PostReadParams {
                     file: &file,
@@ -802,7 +815,12 @@ async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Resul
                 let resp = handle_post_read_request(params, req_start, &state).await;
                 write_message(&mut stream, &resp).await?;
             }
-            DaemonRequest::Distill { file, mode, format } => {
+            DaemonRequest::Distill {
+                file,
+                mode,
+                format,
+                ..
+            } => {
                 let resp = handle_distill_request(&file, mode, format, &state).await;
                 write_message(&mut stream, &resp).await?;
             }

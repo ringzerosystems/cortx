@@ -235,6 +235,9 @@ mod tests {
                 end_line: Some(10),
                 raw_read_bytes: Some(4200),
                 read_kind: None,
+                total_lines: None,
+                vendor: None,
+                is_full_read: None,
             },
         )
         .await
