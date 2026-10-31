@@ -19,6 +19,7 @@ pub use error::DaemonError;
 pub use hook::{
     execute_post_read_bundle, execute_post_read_bundle_for_project, execute_post_read_hook,
     execute_post_read_hook_for_project, execute_post_read_hook_with_overlay,
+    execute_post_read_query,
 };
 pub use logging::{DaemonLogManager, WorkspaceLogger};
 pub use protocol::{
