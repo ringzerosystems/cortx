@@ -820,16 +820,17 @@ fn execute_in_process_fallback(
     tracing::warn!(
         "[{kind_tag}] Daemon offline or unreachable, falling back to in-process distillation"
     );
-    let span = if params.start_line.is_some() || params.end_line.is_some() || params.vendor.is_some() {
-        Some(ReadSpan {
-            start_line: params.start_line,
-            end_line: params.end_line,
-            vendor: params.vendor,
-            ..Default::default()
-        })
-    } else {
-        None
-    };
+    let span =
+        if params.start_line.is_some() || params.end_line.is_some() || params.vendor.is_some() {
+            Some(ReadSpan {
+                start_line: params.start_line,
+                end_line: params.end_line,
+                vendor: params.vendor,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
 
     let owned_source;
     let source = match params.preloaded_source {

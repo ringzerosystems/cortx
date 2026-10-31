@@ -154,6 +154,34 @@ pub(crate) fn format_raw_source_inspected(raw_bytes: u64, supp_bytes: u64) -> St
     )
 }
 
+pub(crate) fn format_daemon_version_protocol(version: &str, protocol: u32) -> String {
+    let ver = if version.is_empty() {
+        "0.1.0"
+    } else {
+        version.strip_prefix('v').unwrap_or(version)
+    };
+    format!(
+        "Daemon Version / Protocol: v{} (protocol v{})",
+        ver, protocol
+    )
+}
+
+pub(crate) fn format_section_dispositions(
+    omitted_micro: u64,
+    omitted_skeletons: u64,
+    trimmed: u64,
+    fallbacks: u64,
+) -> String {
+    format!(
+        "{:<22}{} micro omitted, {} full skeletons omitted, {} trimmed, {} parse fallbacks",
+        "Section Dispositions:",
+        format_with_commas(omitted_micro as usize),
+        format_with_commas(omitted_skeletons as usize),
+        format_with_commas(trimmed as usize),
+        format_with_commas(fallbacks as usize)
+    )
+}
+
 pub(crate) fn format_workspace_registry_row(ws: &WorkspaceSummary) -> String {
     let ws_type = if ws.is_worktree { "WkTr" } else { "Repo" };
     let root_trunc = truncate_tail(&ws.root.display().to_string(), 28);
@@ -201,6 +229,10 @@ pub(crate) fn format_workspace_registry_row(ws: &WorkspaceSummary) -> String {
 
 pub(crate) fn print_daemon_status_table(status: &DaemonStatusInfo) {
     println!("Cortx Daemon Status:  Active");
+    println!(
+        "{}",
+        format_daemon_version_protocol(&status.daemon_version, status.protocol_version)
+    );
     println!("{:<22}{}", "PID:", status.pid);
     println!("{:<22}{}", "Uptime:", format_uptime(status.uptime_secs));
     if !status.daemon_mode.is_empty() {
@@ -272,7 +304,10 @@ pub(crate) fn print_daemon_status_table(status: &DaemonStatusInfo) {
         print_workspace_registry_table(&status.workspaces);
     }
 
-    // --- Context Telemetry Section ---
+    print_context_telemetry(status);
+}
+
+fn print_context_telemetry(status: &DaemonStatusInfo) {
     println!(
         "{}",
         format_hooks_served(status.hooks_served, status.submissions)
@@ -295,6 +330,15 @@ pub(crate) fn print_daemon_status_table(status: &DaemonStatusInfo) {
         println!(
             "{}",
             format_read_operations(status.hooks_served, status.macro_reads, status.micro_reads)
+        );
+        println!(
+            "{}",
+            format_section_dispositions(
+                status.omitted_micro_reads,
+                status.omitted_full_read_skeletons,
+                status.trimmed_advisories,
+                status.parse_fallbacks
+            )
         );
         println!("{}", format_supplemental_context(supp_bytes, supp_tokens));
         println!(
@@ -456,5 +500,33 @@ mod tests {
         assert!(row_active.contains("1"));
         assert!(row_active.contains("7"));
         assert!(row_active.contains("87.5%"));
+    }
+
+    #[test]
+    fn test_format_daemon_version_protocol() {
+        assert_eq!(
+            format_daemon_version_protocol("0.1.0", 2),
+            "Daemon Version / Protocol: v0.1.0 (protocol v2)"
+        );
+        assert_eq!(
+            format_daemon_version_protocol("v0.2.1", 3),
+            "Daemon Version / Protocol: v0.2.1 (protocol v3)"
+        );
+        assert_eq!(
+            format_daemon_version_protocol("", 2),
+            "Daemon Version / Protocol: v0.1.0 (protocol v2)"
+        );
+    }
+
+    #[test]
+    fn test_format_section_dispositions() {
+        assert_eq!(
+            format_section_dispositions(0, 0, 0, 0),
+            "Section Dispositions: 0 micro omitted, 0 full skeletons omitted, 0 trimmed, 0 parse fallbacks"
+        );
+        assert_eq!(
+            format_section_dispositions(12, 3, 4, 1),
+            "Section Dispositions: 12 micro omitted, 3 full skeletons omitted, 4 trimmed, 1 parse fallbacks"
+        );
     }
 }
