@@ -46,6 +46,12 @@ pub struct WorkspaceEntry {
     pub macro_reads: AtomicU64,
     /// Total micro reads (focused inspections <= 150 lines).
     pub micro_reads: AtomicU64,
+    /// Total micro reads with omitted advisory output.
+    pub omitted_micro_reads: AtomicU64,
+    /// Total full-file reads with omitted self-skeletons.
+    pub omitted_full_read_skeletons: AtomicU64,
+    /// Total advisories trimmed to wire character budget.
+    pub trimmed_advisories: AtomicU64,
     /// Timestamp of last activity or hook evaluation.
     last_accessed: std::sync::Mutex<std::time::Instant>,
 }
@@ -76,6 +82,9 @@ impl WorkspaceEntry {
             ast_drops: AtomicU64::new(0),
             macro_reads: AtomicU64::new(0),
             micro_reads: AtomicU64::new(0),
+            omitted_micro_reads: AtomicU64::new(0),
+            omitted_full_read_skeletons: AtomicU64::new(0),
+            trimmed_advisories: AtomicU64::new(0),
             last_accessed: std::sync::Mutex::new(std::time::Instant::now()),
         }
     }
@@ -94,10 +103,7 @@ impl WorkspaceEntry {
     }
 
     /// Attaches shadowed files (modified or deleted worktree files relative to parent).
-    pub fn with_shadowed_files(
-        mut self,
-        shadowed_files: Arc<RwLock<HashSet<PathBuf>>>,
-    ) -> Self {
+    pub fn with_shadowed_files(mut self, shadowed_files: Arc<RwLock<HashSet<PathBuf>>>) -> Self {
         self.shadowed_files = shadowed_files;
         self
     }
@@ -178,6 +184,37 @@ impl WorkspaceEntry {
     pub fn micro_reads(&self) -> u64 {
         self.micro_reads.load(Ordering::Relaxed)
     }
+
+    /// Increments the count of omitted micro-read advisories.
+    pub fn record_omitted_micro_read(&self) {
+        self.omitted_micro_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increments the count of omitted full-read skeletons.
+    pub fn record_omitted_full_read_skeleton(&self) {
+        self.omitted_full_read_skeletons
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increments the count of trimmed advisories.
+    pub fn record_trimmed_advisory(&self) {
+        self.trimmed_advisories.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the total omitted micro-read count for this workspace.
+    pub fn omitted_micro_reads(&self) -> u64 {
+        self.omitted_micro_reads.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total omitted full-read skeletons count for this workspace.
+    pub fn omitted_full_read_skeletons(&self) -> u64 {
+        self.omitted_full_read_skeletons.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total trimmed advisories count for this workspace.
+    pub fn trimmed_advisories(&self) -> u64 {
+        self.trimmed_advisories.load(Ordering::Relaxed)
+    }
 }
 
 /// Detects added or modified files in a worktree and records shadowed (modified or deleted) files.
@@ -223,7 +260,11 @@ fn detect_worktree_changes(
     }
 
     // Check parent indexed files for deletions in worktree
-    for p in base_idx.file_facts.keys().chain(base_idx.file_symbols.keys()) {
+    for p in base_idx
+        .file_facts
+        .keys()
+        .chain(base_idx.file_symbols.keys())
+    {
         let rel = p.strip_prefix(parent_repo).unwrap_or(p);
         if !rel.as_os_str().is_empty() && !worktree_root.join(rel).exists() {
             shadowed.insert(rel.to_path_buf());
