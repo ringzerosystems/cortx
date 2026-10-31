@@ -34,7 +34,9 @@ impl<'a> OverlayView<'a> {
         if shadowed.contains(p) || p.strip_prefix("./").is_ok_and(|rel| shadowed.contains(rel)) {
             return true;
         }
-        shadowed.iter().any(|sf| p.ends_with(sf))
+        shadowed
+            .iter()
+            .any(|sf| p.ends_with(sf) || p.starts_with(sf))
     }
 
     /// Returns true if the given path is masked by a worktree deletion tombstone.
