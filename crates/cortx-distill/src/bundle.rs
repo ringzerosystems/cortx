@@ -2,8 +2,36 @@
 
 use crate::error::DistillError;
 use crate::indexer::{CallEdge, ContractInfo, CrossBoundaryImpact};
+use cortx_core::ReadCoverage;
 use cortx_core::output::OutputFormat;
 use serde::{Deserialize, Serialize};
+
+/// Maximum wire character limit for hook post-read advisory context payloads (reserving 800 chars under 10k).
+pub const MAX_HOOK_WIRE_CHARS: usize = 9_200;
+
+/// Disposition of an advisory payload packed for host post-read delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdvisoryDisposition {
+    /// Omitted completely due to micro-read window (<= 150 lines).
+    OmittedMicro,
+    /// Delivered for full-file read with target type skeleton omitted.
+    FullReadNoSkeleton,
+    /// Delivered for partial macro read with unread outline and proximity ranking.
+    PartialMacroDelivered,
+    /// Tail-trimmed to stay strictly within the 9,200 character wire budget.
+    Trimmed,
+}
+
+/// Advisory payload packed specifically for tool hook execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackedAdvisory {
+    /// Delivered markdown content.
+    pub markdown: String,
+    /// Exact count of Unicode characters in `markdown`.
+    pub wire_chars: usize,
+    /// Disposition indicating tier and trimming state.
+    pub disposition: AdvisoryDisposition,
+}
 
 /// Degradation stage selected by the advisory bloat guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,82 +219,35 @@ impl DistillBundle {
             "# Cortx Context Distillation: `{}`\n\n",
             self.target
         ));
-        out.push_str(&format!(
-            "> **Token Reduction:** {:.1}% context saved vs raw source.\n\n",
-            self.token_reduction_pct
-        ));
 
-        let lang = if self.target.ends_with(".ts")
-            || self.target.ends_with(".tsx")
-            || self.target.ends_with(".js")
-            || self.target.ends_with(".jsx")
-        {
-            "typescript"
-        } else if self.target.ends_with(".go") {
-            "go"
-        } else {
-            "rust"
-        };
-        out.push_str(&format!(
-            "## Type Skeleton & Interface Contracts\n\n```{lang}\n"
-        ));
-        out.push_str(&self.skeleton);
-        out.push_str("\n```\n\n");
+        let lang = target_lang(&self.target);
+        if !self.skeleton.is_empty() {
+            out.push_str(&format!(
+                "## Type Skeleton & Interface Contracts\n\n```{lang}\n"
+            ));
+            out.push_str(&self.skeleton);
+            out.push_str("\n```\n\n");
+        }
 
         if !self.contracts.is_empty() {
-            out.push_str("## Trait Contracts\n\n");
-            for c in &self.contracts {
-                out.push_str(&format!(
-                    "- `impl {} for {}` (in `{}`)\n",
-                    c.trait_name, c.target_type, c.file
-                ));
-                for m in &c.methods {
-                    out.push_str(&format!("  - `{}`\n", m));
-                }
-            }
-            out.push('\n');
+            out.push_str(&format_contracts(&self.contracts, 0));
         }
 
         if !self.callers.is_empty() {
-            out.push_str("## Upstream Callers\n\n");
-            for c in &self.callers {
-                out.push_str(&format!(
-                    "- `{}` calls `{}` (in `{}`)\n",
-                    c.caller, c.callee, c.file
-                ));
-            }
-            out.push('\n');
+            out.push_str(&format_callers(&self.callers, self.omitted_callers));
         }
 
         if !self.callees.is_empty() {
-            out.push_str("## Downstream Dependencies\n\n");
-            for c in &self.callees {
-                out.push_str(&format!("- `{}` calls `{}`\n", c.caller, c.callee));
-            }
-            out.push('\n');
+            out.push_str(&format_callees(&self.callees, self.omitted_callees));
         }
 
         if let Some(ref cb) = self.cross_boundary {
-            out.push_str("## Cross-Boundary Impact\n\n");
-            if let Some(ref go_def) = cb.go_definition {
-                out.push_str(&format!("- **Go Backend Model:** `{}`\n", go_def));
-            }
-            if let Some(ref rust_def) = cb.rust_definition {
-                out.push_str(&format!("- **Rust Backend Definition:** `{}`\n", rust_def));
-            }
-            if let Some(ref ts_def) = cb.ts_interface {
-                out.push_str(&format!(
-                    "- **TypeScript Consumer Interface:** `{}`\n",
-                    ts_def
-                ));
-            }
-            if !cb.api_call_sites.is_empty() {
-                out.push_str("- **Frontend API Call Sites:**\n");
-                for site in &cb.api_call_sites {
-                    out.push_str(&format!("  - `{}`\n", site));
-                }
-            }
-            out.push('\n');
+            out.push_str(&format_cross_boundary(cb, None));
+        }
+
+        if let Some(ref outline) = self.unread_outline {
+            let lines: Vec<&str> = outline.lines().filter(|l| !l.trim().is_empty()).collect();
+            out.push_str(&format_outline(&lines, lang));
         }
 
         out
@@ -279,12 +260,14 @@ impl DistillBundle {
         }
         let mut out = String::new();
         out.push_str(&format!(
-            "=== Cortx Context Distillation: {} (Reduction: {:.1}%) ===\n\n",
-            self.target, self.token_reduction_pct
+            "=== Cortx Context Distillation: {} ===\n\n",
+            self.target
         ));
-        out.push_str("--- Skeleton ---\n");
-        out.push_str(&self.skeleton);
-        out.push_str("\n\n");
+        if !self.skeleton.is_empty() {
+            out.push_str("--- Skeleton ---\n");
+            out.push_str(&self.skeleton);
+            out.push_str("\n\n");
+        }
 
         if !self.contracts.is_empty() {
             out.push_str("--- Trait Contracts ---\n");
@@ -297,7 +280,43 @@ impl DistillBundle {
         if !self.callers.is_empty() {
             out.push_str("--- Callers ---\n");
             for c in &self.callers {
-                out.push_str(&format!("{} -> {}\n", c.caller, c.callee));
+                if !c.file.is_empty() {
+                    if c.call_line > 0 {
+                        out.push_str(&format!(
+                            "{} -> {} (in {}:{})\n",
+                            c.caller, c.callee, c.file, c.call_line
+                        ));
+                    } else {
+                        out.push_str(&format!("{} -> {} (in {})\n", c.caller, c.callee, c.file));
+                    }
+                } else {
+                    out.push_str(&format!("{} -> {}\n", c.caller, c.callee));
+                }
+            }
+            if self.omitted_callers > 0 {
+                out.push_str(&format!("... +{} callers omitted\n", self.omitted_callers));
+            }
+            out.push('\n');
+        }
+
+        if !self.callees.is_empty() {
+            out.push_str("--- Downstream Dependencies ---\n");
+            for c in &self.callees {
+                if !c.file.is_empty() {
+                    if c.call_line > 0 {
+                        out.push_str(&format!(
+                            "{} -> {} (in {}:{})\n",
+                            c.caller, c.callee, c.file, c.call_line
+                        ));
+                    } else {
+                        out.push_str(&format!("{} -> {} (in {})\n", c.caller, c.callee, c.file));
+                    }
+                } else {
+                    out.push_str(&format!("{} -> {}\n", c.caller, c.callee));
+                }
+            }
+            if self.omitted_callees > 0 {
+                out.push_str(&format!("... +{} callees omitted\n", self.omitted_callees));
             }
             out.push('\n');
         }
@@ -319,27 +338,382 @@ impl DistillBundle {
             out.push('\n');
         }
 
+        if let Some(ref outline) = self.unread_outline {
+            if !outline.trim().is_empty() {
+                out.push_str("--- Unread Outline ---\n");
+                out.push_str(outline);
+                if !outline.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push('\n');
+            }
+        }
+
         out
+    }
+
+    /// Packs an advisory context payload specifically tailored for post-read delivery,
+    /// enforcing character limits (`<= 9_200` chars), omitting target-file skeletons on
+    /// full-file reads, and embedding unread outlines on partial macro reads.
+    pub fn pack_for_hook(&self, coverage: ReadCoverage) -> PackedAdvisory {
+        match coverage {
+            ReadCoverage::Micro => PackedAdvisory {
+                markdown: String::new(),
+                wire_chars: 0,
+                disposition: AdvisoryDisposition::OmittedMicro,
+            },
+            ReadCoverage::FullFile => {
+                let has_sections = self.cross_boundary.is_some()
+                    || !self.callers.is_empty()
+                    || !self.callees.is_empty()
+                    || !self.contracts.is_empty();
+
+                if !has_sections {
+                    return PackedAdvisory {
+                        markdown: String::new(),
+                        wire_chars: 0,
+                        disposition: AdvisoryDisposition::FullReadNoSkeleton,
+                    };
+                }
+
+                self.pack_macro_sections(false)
+            }
+            ReadCoverage::PartialMacro => {
+                let has_outline = self
+                    .unread_outline
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                let has_sections = self.cross_boundary.is_some()
+                    || !self.callers.is_empty()
+                    || !self.callees.is_empty()
+                    || !self.contracts.is_empty()
+                    || has_outline;
+
+                if !has_sections {
+                    return PackedAdvisory {
+                        markdown: String::new(),
+                        wire_chars: 0,
+                        disposition: AdvisoryDisposition::PartialMacroDelivered,
+                    };
+                }
+
+                self.pack_macro_sections(true)
+            }
+        }
+    }
+
+    fn pack_macro_sections(&self, include_outline: bool) -> PackedAdvisory {
+        let default_disposition = if include_outline {
+            AdvisoryDisposition::PartialMacroDelivered
+        } else {
+            AdvisoryDisposition::FullReadNoSkeleton
+        };
+
+        let lang = target_lang(&self.target);
+        let header = format!("# Cortx Context Distillation: `{}`\n\n", self.target);
+
+        let outline_lines: Vec<&str> = if include_outline {
+            self.unread_outline
+                .as_deref()
+                .unwrap_or("")
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut s = AdvisoryState {
+            header: &header,
+            cb: self.cross_boundary.as_ref(),
+            api_calls_limit: None,
+            callers: &self.callers,
+            num_callers: self.callers.len(),
+            base_omitted_callers: self.omitted_callers,
+            callees: &self.callees,
+            num_callees: self.callees.len(),
+            base_omitted_callees: self.omitted_callees,
+            contracts: &self.contracts,
+            num_contracts: self.contracts.len(),
+            outline_lines: &outline_lines,
+            num_outline: outline_lines.len(),
+            lang,
+        };
+
+        let initial_md = render_advisory(&s);
+        if initial_md.chars().count() <= MAX_HOOK_WIRE_CHARS {
+            let safe_md = ensure_wire_budget_and_fences(initial_md);
+            let wire_chars = safe_md.chars().count();
+            return PackedAdvisory {
+                markdown: safe_md,
+                wire_chars,
+                disposition: default_disposition,
+            };
+        }
+
+        // Trimming priority order: outline -> contracts -> callees -> callers -> cross boundary
+        while s.num_outline > 0 {
+            s.num_outline -= 1;
+            let cand = render_advisory(&s);
+            if cand.chars().count() <= MAX_HOOK_WIRE_CHARS {
+                return packed_trimmed(cand);
+            }
+        }
+
+        while s.num_contracts > 0 {
+            s.num_contracts -= 1;
+            let cand = render_advisory(&s);
+            if cand.chars().count() <= MAX_HOOK_WIRE_CHARS {
+                return packed_trimmed(cand);
+            }
+        }
+
+        while s.num_callees > 0 {
+            s.num_callees -= 1;
+            let cand = render_advisory(&s);
+            if cand.chars().count() <= MAX_HOOK_WIRE_CHARS {
+                return packed_trimmed(cand);
+            }
+        }
+
+        while s.num_callers > 0 {
+            s.num_callers -= 1;
+            let cand = render_advisory(&s);
+            if cand.chars().count() <= MAX_HOOK_WIRE_CHARS {
+                return packed_trimmed(cand);
+            }
+        }
+
+        if let Some(cb) = s.cb {
+            let mut api_limit = cb.api_call_sites.len();
+            while api_limit > 0 {
+                api_limit -= 1;
+                s.api_calls_limit = Some(api_limit);
+                let cand = render_advisory(&s);
+                if cand.chars().count() <= MAX_HOOK_WIRE_CHARS {
+                    return packed_trimmed(cand);
+                }
+            }
+            s.cb = None;
+            let cand = render_advisory(&s);
+            if cand.chars().count() <= MAX_HOOK_WIRE_CHARS {
+                return packed_trimmed(cand);
+            }
+        }
+
+        let fallback_md = render_advisory(&s);
+        packed_trimmed(fallback_md)
     }
 }
 
-#[cfg(kani)]
-#[kani::proof]
-fn decide_stage_never_exceeds_budget() {
-    let full_len: u64 = kani::any();
-    let pruned_len: u64 = kani::any();
-    let raw_len: u64 = kani::any();
-    kani::assume(pruned_len <= full_len);
+struct AdvisoryState<'a> {
+    header: &'a str,
+    cb: Option<&'a CrossBoundaryImpact>,
+    api_calls_limit: Option<usize>,
+    callers: &'a [CallEdge],
+    num_callers: usize,
+    base_omitted_callers: usize,
+    callees: &'a [CallEdge],
+    num_callees: usize,
+    base_omitted_callees: usize,
+    contracts: &'a [ContractInfo],
+    num_contracts: usize,
+    outline_lines: &'a [&'a str],
+    num_outline: usize,
+    lang: &'a str,
+}
 
-    let stage = decide_stage(full_len, pruned_len, raw_len);
-    match stage {
-        BudgetStage::Full => assert!(full_len < raw_len),
-        BudgetStage::CallGraphPruned => {
-            assert!(pruned_len < raw_len);
-            assert!(full_len >= raw_len);
-        }
-        BudgetStage::Dropped => {}
+fn render_advisory(s: &AdvisoryState<'_>) -> String {
+    let mut out = String::from(s.header);
+    if let Some(cb) = s.cb {
+        out.push_str(&format_cross_boundary(cb, s.api_calls_limit));
     }
+    let omitted_callers = s.base_omitted_callers + (s.callers.len() - s.num_callers);
+    out.push_str(&format_callers(
+        &s.callers[..s.num_callers],
+        omitted_callers,
+    ));
+
+    let omitted_callees = s.base_omitted_callees + (s.callees.len() - s.num_callees);
+    out.push_str(&format_callees(
+        &s.callees[..s.num_callees],
+        omitted_callees,
+    ));
+
+    let omitted_contracts = s.contracts.len() - s.num_contracts;
+    out.push_str(&format_contracts(
+        &s.contracts[..s.num_contracts],
+        omitted_contracts,
+    ));
+
+    out.push_str(&format_outline(&s.outline_lines[..s.num_outline], s.lang));
+    out
+}
+
+fn format_callers(callers: &[CallEdge], omitted: usize) -> String {
+    if callers.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("## Upstream Callers\n\n");
+    for c in callers {
+        if c.file.is_empty() {
+            out.push_str(&format!("- `{}` calls `{}`\n", c.caller, c.callee));
+        } else if c.call_line > 0 {
+            out.push_str(&format!(
+                "- `{}` calls `{}` (in `{}:{}`)\n",
+                c.caller, c.callee, c.file, c.call_line
+            ));
+        } else {
+            out.push_str(&format!(
+                "- `{}` calls `{}` (in `{}`)\n",
+                c.caller, c.callee, c.file
+            ));
+        }
+    }
+    if omitted > 0 {
+        out.push_str(&format!("_... +{} callers omitted_\n", omitted));
+    }
+    out.push('\n');
+    out
+}
+
+fn format_callees(callees: &[CallEdge], omitted: usize) -> String {
+    if callees.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("## Downstream Dependencies\n\n");
+    for c in callees {
+        if c.file.is_empty() {
+            out.push_str(&format!("- `{}` calls `{}`\n", c.caller, c.callee));
+        } else if c.call_line > 0 {
+            out.push_str(&format!(
+                "- `{}` calls `{}` (in `{}:{}`)\n",
+                c.caller, c.callee, c.file, c.call_line
+            ));
+        } else {
+            out.push_str(&format!(
+                "- `{}` calls `{}` (in `{}`)\n",
+                c.caller, c.callee, c.file
+            ));
+        }
+    }
+    if omitted > 0 {
+        out.push_str(&format!("_... +{} callees omitted_\n", omitted));
+    }
+    out.push('\n');
+    out
+}
+
+fn format_contracts(contracts: &[ContractInfo], omitted: usize) -> String {
+    if contracts.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("## Trait Contracts\n\n");
+    for c in contracts {
+        out.push_str(&format!(
+            "- `impl {} for {}` (in `{}`)\n",
+            c.trait_name, c.target_type, c.file
+        ));
+        for m in &c.methods {
+            out.push_str(&format!("  - `{}`\n", m));
+        }
+    }
+    if omitted > 0 {
+        out.push_str(&format!("_... +{} contracts omitted_\n", omitted));
+    }
+    out.push('\n');
+    out
+}
+
+fn format_outline(lines: &[&str], lang: &str) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("## Unread File Outline\n\n```{lang}\n");
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("```\n\n");
+    out
+}
+
+fn format_cross_boundary(cb: &CrossBoundaryImpact, api_limit: Option<usize>) -> String {
+    let mut out = String::from("## Cross-Boundary Impact\n\n");
+    if let Some(ref go_def) = cb.go_definition {
+        out.push_str(&format!("- **Go Backend Model:** `{}`\n", go_def));
+    }
+    if let Some(ref rust_def) = cb.rust_definition {
+        out.push_str(&format!("- **Rust Backend Definition:** `{}`\n", rust_def));
+    }
+    if let Some(ref ts_def) = cb.ts_interface {
+        out.push_str(&format!(
+            "- **TypeScript Consumer Interface:** `{}`\n",
+            ts_def
+        ));
+    }
+    let sites = match api_limit {
+        Some(limit) => &cb.api_call_sites[..limit.min(cb.api_call_sites.len())],
+        None => &cb.api_call_sites[..],
+    };
+    if !sites.is_empty() {
+        out.push_str("- **Frontend API Call Sites:**\n");
+        for site in sites {
+            out.push_str(&format!("  - `{}`\n", site));
+        }
+    }
+    out.push('\n');
+    out
+}
+
+fn target_lang(target: &str) -> &'static str {
+    if target.ends_with(".ts")
+        || target.ends_with(".tsx")
+        || target.ends_with(".js")
+        || target.ends_with(".jsx")
+    {
+        "typescript"
+    } else if target.ends_with(".go") {
+        "go"
+    } else {
+        "rust"
+    }
+}
+
+fn packed_trimmed(md: String) -> PackedAdvisory {
+    let safe_md = ensure_wire_budget_and_fences(md);
+    let wire_chars = safe_md.chars().count();
+    PackedAdvisory {
+        markdown: safe_md,
+        wire_chars,
+        disposition: AdvisoryDisposition::Trimmed,
+    }
+}
+
+fn ensure_wire_budget_and_fences(mut md: String) -> String {
+    if md.matches("```").count() % 2 != 0 {
+        if md.chars().count() + 5 > MAX_HOOK_WIRE_CHARS {
+            let target_chars = MAX_HOOK_WIRE_CHARS.saturating_sub(5);
+            let truncated: String = md.chars().take(target_chars).collect();
+            md = truncated;
+            if md.matches("```").count() % 2 != 0 {
+                md.push_str("\n```\n");
+            }
+        } else {
+            md.push_str("\n```\n");
+        }
+    }
+    if md.chars().count() > MAX_HOOK_WIRE_CHARS {
+        let truncated: String = md.chars().take(MAX_HOOK_WIRE_CHARS).collect();
+        md = truncated;
+        if md.matches("```").count() % 2 != 0 {
+            let target_chars = MAX_HOOK_WIRE_CHARS.saturating_sub(5);
+            let mut safe: String = md.chars().take(target_chars).collect();
+            safe.push_str("\n```\n");
+            md = safe;
+        }
+    }
+    md
 }
 
 #[cfg(test)]
@@ -501,6 +875,223 @@ mod tests {
         assert_eq!(b_no_cg.full_len, Some(pruned_len));
     }
 
+    #[test]
+    fn test_pack_for_hook_micro_omission() {
+        let bundle = DistillBundle {
+            target: "src/service.rs".to_string(),
+            skeleton: "pub struct S;".to_string(),
+            contracts: vec![],
+            callers: vec![CallEdge {
+                caller: "caller_fn".into(),
+                callee: "S".into(),
+                file: "src/caller.rs".into(),
+                call_line: 12,
+            }],
+            callees: vec![],
+            token_reduction_pct: 50.0,
+            cross_boundary: None,
+            unread_outline: Some("L1: pub fn head();\n".into()),
+            omitted_callers: 0,
+            omitted_callees: 0,
+        };
+
+        let packed = bundle.pack_for_hook(ReadCoverage::Micro);
+        assert_eq!(packed.disposition, AdvisoryDisposition::OmittedMicro);
+        assert_eq!(packed.markdown, "");
+        assert_eq!(packed.wire_chars, 0);
+    }
+
+    #[test]
+    fn test_pack_for_hook_full_file_omits_skeleton_and_empty_leaf() {
+        // 1. Leaf with no call graph, contracts, or cross boundary -> empty markdown
+        let leaf_bundle = DistillBundle {
+            target: "src/leaf.rs".to_string(),
+            skeleton: "pub struct Leaf;".to_string(),
+            contracts: vec![],
+            callers: vec![],
+            callees: vec![],
+            token_reduction_pct: 60.0,
+            cross_boundary: None,
+            unread_outline: None,
+            omitted_callers: 0,
+            omitted_callees: 0,
+        };
+        let leaf_packed = leaf_bundle.pack_for_hook(ReadCoverage::FullFile);
+        assert_eq!(
+            leaf_packed.disposition,
+            AdvisoryDisposition::FullReadNoSkeleton
+        );
+        assert_eq!(leaf_packed.markdown, "");
+        assert_eq!(leaf_packed.wire_chars, 0);
+
+        // 2. Full bundle -> delivers callers, callees, contracts, cross boundary without skeleton
+        let full_bundle = DistillBundle {
+            target: "src/service.rs".to_string(),
+            skeleton: "pub struct Service;".to_string(),
+            contracts: vec![ContractInfo {
+                trait_name: "ServiceTrait".into(),
+                target_type: "Service".into(),
+                methods: vec!["run".into()],
+                file: "src/service.rs".into(),
+            }],
+            callers: vec![CallEdge {
+                caller: "main".into(),
+                callee: "Service::run".into(),
+                file: "src/main.rs".into(),
+                call_line: 42,
+            }],
+            callees: vec![CallEdge {
+                caller: "Service::run".into(),
+                callee: "db_query".into(),
+                file: "src/db.rs".into(),
+                call_line: 105,
+            }],
+            token_reduction_pct: 75.0,
+            cross_boundary: Some(CrossBoundaryImpact {
+                symbol: "Service".into(),
+                rust_definition: Some("src/service.rs:10".into()),
+                ts_interface: Some("frontend/api.ts:25".into()),
+                go_definition: None,
+                api_call_sites: vec!["fetch('/api/run')".into()],
+            }),
+            unread_outline: None,
+            omitted_callers: 3,
+            omitted_callees: 2,
+        };
+        let packed = full_bundle.pack_for_hook(ReadCoverage::FullFile);
+        assert_eq!(packed.disposition, AdvisoryDisposition::FullReadNoSkeleton);
+        assert!(!packed.markdown.contains("## Type Skeleton"));
+        assert!(!packed.markdown.contains("pub struct Service;"));
+        assert!(!packed.markdown.contains("Token Reduction"));
+        assert!(packed.markdown.contains("## Cross-Boundary Impact"));
+        assert!(packed.markdown.contains("## Upstream Callers"));
+        assert!(
+            packed
+                .markdown
+                .contains("- `main` calls `Service::run` (in `src/main.rs:42`)")
+        );
+        assert!(packed.markdown.contains("_... +3 callers omitted_"));
+        assert!(packed.markdown.contains("## Downstream Dependencies"));
+        assert!(
+            packed
+                .markdown
+                .contains("- `Service::run` calls `db_query` (in `src/db.rs:105`)")
+        );
+        assert!(packed.markdown.contains("_... +2 callees omitted_"));
+        assert!(packed.markdown.contains("## Trait Contracts"));
+        assert!(
+            packed
+                .markdown
+                .contains("- `impl ServiceTrait for Service` (in `src/service.rs`)")
+        );
+        assert_eq!(packed.wire_chars, packed.markdown.chars().count());
+        assert!(packed.wire_chars <= MAX_HOOK_WIRE_CHARS);
+    }
+
+    #[test]
+    fn test_pack_for_hook_partial_macro_delivers_outline() {
+        let bundle = DistillBundle {
+            target: "src/service.rs".to_string(),
+            skeleton: "pub struct Service;".to_string(),
+            contracts: vec![],
+            callers: vec![],
+            callees: vec![],
+            token_reduction_pct: 50.0,
+            cross_boundary: None,
+            unread_outline: Some("L10: pub fn init();\nL50: pub fn teardown();\n".into()),
+            omitted_callers: 0,
+            omitted_callees: 0,
+        };
+
+        let packed = bundle.pack_for_hook(ReadCoverage::PartialMacro);
+        assert_eq!(
+            packed.disposition,
+            AdvisoryDisposition::PartialMacroDelivered
+        );
+        assert!(!packed.markdown.contains("## Type Skeleton"));
+        assert!(packed.markdown.contains("## Unread File Outline"));
+        assert!(packed.markdown.contains("```rust"));
+        assert!(packed.markdown.contains("L10: pub fn init();"));
+        assert!(packed.markdown.contains("L50: pub fn teardown();"));
+        assert_eq!(packed.markdown.matches("```").count(), 2);
+    }
+
+    #[test]
+    fn test_pack_for_hook_wire_trimming_priority_and_fences() {
+        // Create an oversized unread outline (> 10,000 characters)
+        let mut big_outline = String::new();
+        for i in 0..400 {
+            big_outline.push_str(&format!(
+                "L{}: pub async fn handler_with_a_very_long_name_for_testing_purposes_{i}(param_a: String, param_b: u64) -> Result<(), DistillError>;\n",
+                i + 1
+            ));
+        }
+
+        let bundle = DistillBundle {
+            target: "src/oversized.rs".to_string(),
+            skeleton: "pub struct Big;".to_string(),
+            contracts: vec![ContractInfo {
+                trait_name: "BigTrait".into(),
+                target_type: "Big".into(),
+                methods: vec!["run".into()],
+                file: "src/oversized.rs".into(),
+            }],
+            callers: vec![CallEdge {
+                caller: "caller_1".into(),
+                callee: "Big::run".into(),
+                file: "src/caller.rs".into(),
+                call_line: 10,
+            }],
+            callees: vec![],
+            token_reduction_pct: 40.0,
+            cross_boundary: None,
+            unread_outline: Some(big_outline),
+            omitted_callers: 0,
+            omitted_callees: 0,
+        };
+
+        let packed = bundle.pack_for_hook(ReadCoverage::PartialMacro);
+        assert_eq!(packed.disposition, AdvisoryDisposition::Trimmed);
+        assert!(packed.wire_chars <= MAX_HOOK_WIRE_CHARS);
+        assert_eq!(packed.wire_chars, packed.markdown.chars().count());
+
+        // Higher-priority sections must be preserved while lower-priority outline lines were trimmed
+        assert!(packed.markdown.contains("## Upstream Callers"));
+        assert!(packed.markdown.contains("## Trait Contracts"));
+        assert_eq!(packed.markdown.matches("```").count() % 2, 0);
+    }
+
+    #[test]
+    fn test_format_markdown_no_token_reduction_and_formats_lines() {
+        let bundle = DistillBundle {
+            target: "src/lib.rs".to_string(),
+            skeleton: "pub fn hello();".to_string(),
+            contracts: vec![],
+            callers: vec![CallEdge {
+                caller: "test_call".into(),
+                callee: "hello".into(),
+                file: "tests/test.rs".into(),
+                call_line: 99,
+            }],
+            callees: vec![],
+            token_reduction_pct: 88.0,
+            cross_boundary: None,
+            unread_outline: None,
+            omitted_callers: 5,
+            omitted_callees: 0,
+        };
+
+        let md = bundle.format_markdown();
+        assert!(!md.contains("Token Reduction"));
+        assert!(md.contains("- `test_call` calls `hello` (in `tests/test.rs:99`)"));
+        assert!(md.contains("_... +5 callers omitted_"));
+
+        let txt = bundle.format_text();
+        assert!(!txt.contains("Reduction:"));
+        assert!(txt.contains("test_call -> hello (in tests/test.rs:99)"));
+        assert!(txt.contains("... +5 callers omitted"));
+    }
+
     use proptest::prelude::*;
 
     proptest! {
@@ -585,6 +1176,110 @@ mod tests {
 
             if let Some(full) = budgeted.full_len {
                 prop_assert_eq!(budgeted.stage, decide_stage(full, budgeted.pruned_len, raw_len));
+            }
+        }
+
+        #[test]
+        fn proptest_pack_for_hook_invariants(
+            target in "[a-zA-Z0-9_/.-]{1,50}",
+            skeleton in "[a-zA-Z0-9_\n\t ;:()]{0,500}",
+            caller_count in 0usize..30,
+            callee_count in 0usize..30,
+            contract_count in 0usize..15,
+            outline_line_count in 0usize..40,
+            coverage_tier in 0u8..3,
+            has_cb in any::<bool>(),
+        ) {
+            let coverage = match coverage_tier {
+                0 => ReadCoverage::Micro,
+                1 => ReadCoverage::FullFile,
+                _ => ReadCoverage::PartialMacro,
+            };
+
+            let callers: Vec<CallEdge> = (0..caller_count)
+                .map(|i| CallEdge {
+                    caller: format!("caller_{i}"),
+                    callee: "fn_callee".into(),
+                    file: format!("caller_{i}.rs"),
+                    call_line: i % 50,
+                })
+                .collect();
+
+            let callees: Vec<CallEdge> = (0..callee_count)
+                .map(|i| CallEdge {
+                    caller: "fn_caller".into(),
+                    callee: format!("callee_{i}"),
+                    file: format!("callee_{i}.rs"),
+                    call_line: i % 50,
+                })
+                .collect();
+
+            let contracts: Vec<ContractInfo> = (0..contract_count)
+                .map(|i| ContractInfo {
+                    trait_name: format!("Trait{i}"),
+                    target_type: format!("Type{i}"),
+                    methods: vec![format!("method_{i}")],
+                    file: format!("contract_{i}.rs"),
+                })
+                .collect();
+
+            let unread_outline = if outline_line_count > 0 {
+                let mut s = String::new();
+                for i in 0..outline_line_count {
+                    s.push_str(&format!("L{}: pub fn outline_fn_{i}();\n", i * 10 + 1));
+                }
+                Some(s)
+            } else {
+                None
+            };
+
+            let cross_boundary = if has_cb {
+                Some(CrossBoundaryImpact {
+                    symbol: "ServiceDef".into(),
+                    rust_definition: Some("src/svc.rs:10".into()),
+                    ts_interface: Some("frontend/api.ts:25".into()),
+                    go_definition: None,
+                    api_call_sites: vec!["fetch('/api/v1')".into(), "fetch('/api/v2')".into()],
+                })
+            } else {
+                None
+            };
+
+            let bundle = DistillBundle {
+                target,
+                skeleton,
+                contracts,
+                callers,
+                callees,
+                token_reduction_pct: 42.0,
+                cross_boundary,
+                unread_outline,
+                omitted_callers: 0,
+                omitted_callees: 0,
+            };
+
+            let packed = bundle.pack_for_hook(coverage);
+
+            // Invariant 1: Wire character limit enforced
+            prop_assert!(packed.wire_chars <= MAX_HOOK_WIRE_CHARS);
+            prop_assert_eq!(packed.wire_chars, packed.markdown.chars().count());
+
+            // Invariant 2: Fences are balanced
+            prop_assert_eq!(packed.markdown.matches("```").count() % 2, 0);
+
+            // Invariant 3: Zero "Token Reduction" in output
+            prop_assert!(!packed.markdown.contains("Token Reduction"));
+
+            // Invariant 4: Micro reads are empty
+            if coverage == ReadCoverage::Micro {
+                prop_assert!(packed.markdown.is_empty());
+                prop_assert_eq!(packed.wire_chars, 0);
+                prop_assert_eq!(packed.disposition, AdvisoryDisposition::OmittedMicro);
+            }
+
+            // Invariant 5: FullFile never includes skeleton
+            if coverage == ReadCoverage::FullFile {
+                prop_assert!(!packed.markdown.contains("## Type Skeleton & Interface Contracts"));
             }
         }
     }

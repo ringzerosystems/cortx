@@ -14,7 +14,10 @@ pub mod indexer;
 pub mod skeleton;
 pub mod ts_skeleton;
 
-pub use bundle::{BudgetStage, BudgetedAdvisory, DistillBundle, decide_stage};
+pub use bundle::{
+    AdvisoryDisposition, BudgetStage, BudgetedAdvisory, DistillBundle, MAX_HOOK_WIRE_CHARS,
+    PackedAdvisory, decide_stage,
+};
 pub use error::DistillError;
 pub use go_skeleton::{
     GoIndexedData, extract_go_file_skeleton, extract_go_file_skeleton_with_options,
