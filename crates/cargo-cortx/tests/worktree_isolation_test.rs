@@ -383,7 +383,10 @@ pub fn soon_deleted_caller(engine: &ServiceEngine) -> bool {
     run_git_cmd(&main_repo, &["commit", "-m", "init overlay fixture"]);
 
     let wt_str = wt_dir.to_str().unwrap();
-    run_git_cmd(&main_repo, &["worktree", "add", "-b", "feat-overlay", wt_str]);
+    run_git_cmd(
+        &main_repo,
+        &["worktree", "add", "-b", "feat-overlay", wt_str],
+    );
 
     // Modify caller_one.rs in worktree
     std::fs::write(
@@ -476,7 +479,10 @@ async fn test_worktree_overlay_union_and_deletion_tombstones() {
             advisory_block
         );
     } else {
-        panic!("Unexpected response from daemon for worktree: {:?}", resp_wt);
+        panic!(
+            "Unexpected response from daemon for worktree: {:?}",
+            resp_wt
+        );
     }
 
     // 2. Query main_lib -> parent repository index remains intact
@@ -513,7 +519,10 @@ async fn test_worktree_overlay_union_and_deletion_tombstones() {
             advisory_block
         );
     } else {
-        panic!("Unexpected response from daemon for parent: {:?}", resp_parent);
+        panic!(
+            "Unexpected response from daemon for parent: {:?}",
+            resp_parent
+        );
     }
 
     // 3. Graceful shutdown
