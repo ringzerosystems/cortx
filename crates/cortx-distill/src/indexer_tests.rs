@@ -716,6 +716,10 @@ fn test_string_pool() {
     assert_eq!(pool.len(), 2);
     assert!(!pool.is_empty());
 
+    let id_d = pool.intern_string("owned_func".to_string());
+    assert_eq!(pool.intern("owned_func"), id_d);
+    assert_eq!(pool.len(), 3);
+
     // Verify CompactCallEdge size is exactly 16 bytes (4 * 4-byte fields)
     assert_eq!(std::mem::size_of::<SymbolId>(), 4);
     assert_eq!(std::mem::size_of::<CompactCallEdge>(), 16);

@@ -28,6 +28,7 @@ regex = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-go = { workspace = true }
 rayon = { workspace = true }
+rustc-hash = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

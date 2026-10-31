@@ -1,7 +1,7 @@
 //! String interning pool and compact call graph edge representations.
 
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Compact identifier for an interned string in `StringPool`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -38,7 +38,7 @@ pub struct StringPool {
     /// Contiguous array of interned strings indexed by SymbolId.
     pub strings: Vec<String>,
     /// Fast deduplication lookup mapping string slice to SymbolId.
-    pub lookup: HashMap<String, SymbolId>,
+    pub lookup: FxHashMap<String, SymbolId>,
 }
 
 impl StringPool {
@@ -51,7 +51,7 @@ impl StringPool {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             strings: Vec::with_capacity(capacity),
-            lookup: HashMap::with_capacity(capacity),
+            lookup: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
         }
     }
 
@@ -62,8 +62,20 @@ impl StringPool {
         }
         let id = SymbolId(self.strings.len() as u32);
         let owned = s.to_string();
+        // ponytail: clone needed for dual Vec/FxHashMap index without unsafe self-referential borrows
         self.strings.push(owned.clone());
         self.lookup.insert(owned, id);
+        id
+    }
+
+    /// Interns an owned string, avoiding redundant string allocations when already present or interned.
+    pub fn intern_string(&mut self, s: String) -> SymbolId {
+        if let Some(&id) = self.lookup.get(s.as_str()) {
+            return id;
+        }
+        let id = SymbolId(self.strings.len() as u32);
+        self.strings.push(s.clone());
+        self.lookup.insert(s, id);
         id
     }
 
