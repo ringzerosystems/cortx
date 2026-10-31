@@ -21,7 +21,7 @@ use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-/// Lock-free context bloat reduction telemetry counters.
+/// Lock-free server telemetry counters.
 #[derive(Debug, Default)]
 pub struct ServerTelemetry {
     pub hooks_served: AtomicU64,
@@ -30,7 +30,6 @@ pub struct ServerTelemetry {
     pub ast_drops: AtomicU64,
     pub raw_bytes_served: AtomicU64,
     pub delivered_bytes_served: AtomicU64,
-    pub bytes_saved: AtomicU64,
     pub macro_reads: AtomicU64,
     pub micro_reads: AtomicU64,
     pub omitted_micro_reads: AtomicU64,
@@ -39,20 +38,13 @@ pub struct ServerTelemetry {
 }
 
 impl ServerTelemetry {
-    /// Records reduction metrics for a single request and returns the per-request reduction percentage.
-    pub fn record_reduction(&self, raw_bytes: u64, delivered_bytes: u64) -> f64 {
+    /// Records hook metrics (served count, raw bytes inspected, delivered advisory bytes).
+    pub fn record_hook_metrics(&self, raw_bytes: u64, delivered_bytes: u64) {
         self.hooks_served.fetch_add(1, Ordering::Relaxed);
         self.raw_bytes_served
             .fetch_add(raw_bytes, Ordering::Relaxed);
         self.delivered_bytes_served
             .fetch_add(delivered_bytes, Ordering::Relaxed);
-        let saved = raw_bytes.saturating_sub(delivered_bytes);
-        self.bytes_saved.fetch_add(saved, Ordering::Relaxed);
-        if raw_bytes > 0 {
-            ((raw_bytes as f64 - delivered_bytes as f64) / raw_bytes as f64) * 100.0
-        } else {
-            0.0
-        }
     }
 
     /// Increments the count of successful advisory context submissions.
@@ -107,20 +99,12 @@ impl ServerTelemetry {
         self.trimmed_advisories.load(Ordering::Relaxed)
     }
 
-    /// Returns a snapshot of cumulative telemetry computed directly from `raw` vs `delivered`:
-    /// (hooks_served, raw_bytes, delivered_bytes, bytes_saved, reduction_pct, est_tokens_saved).
-    pub fn snapshot(&self) -> (u64, u64, u64, u64, f64, u64) {
+    /// Returns a snapshot of cumulative telemetry: (hooks_served, raw_bytes, delivered_bytes).
+    pub fn snapshot(&self) -> (u64, u64, u64) {
         let hooks = self.hooks_served.load(Ordering::Relaxed);
         let raw = self.raw_bytes_served.load(Ordering::Relaxed);
         let delivered = self.delivered_bytes_served.load(Ordering::Relaxed);
-        let saved = raw.saturating_sub(delivered);
-        let pct = if raw > 0 {
-            ((raw as f64 - delivered as f64) / raw as f64) * 100.0
-        } else {
-            0.0
-        };
-        let est_tokens = saved / cortx_core::span::EST_BYTES_PER_TOKEN;
-        (hooks, raw, delivered, saved, pct, est_tokens)
+        (hooks, raw, delivered)
     }
 }
 
@@ -458,15 +442,14 @@ async fn handle_post_read_request(
             .fetch_add(1, Ordering::Relaxed);
 
         let raw_len = params.raw_read_bytes.unwrap_or(0);
-        let pct = state.telemetry.record_reduction(raw_len, 0);
+        state.telemetry.record_hook_metrics(raw_len, 0);
         let elapsed_us = req_start.elapsed().as_micros();
         let range_str = format_range(params.start_line, params.end_line);
         let log_msg = format!(
-            "[MICRO] PostReadHook skipped (micro-read): '{}'{} | raw: {} B | delivered: 0 B | reduction: {:.1}% | latency: {:.1}ms",
+            "[MICRO] PostReadHook skipped (micro-read): '{}'{} | raw: {} B | delivered: 0 B | latency: {:.1}ms",
             file.display(),
             range_str,
             raw_len,
-            pct,
             elapsed_us as f64 / 1000.0,
         );
         state.log_manager.log_daemon(&log_msg);
@@ -636,7 +619,7 @@ async fn execute_macro_post_read(
 
             record_packed_disposition_telemetry(&packed, state, entry.as_deref());
 
-            let pct = state.telemetry.record_reduction(raw_len, delivered_len);
+            state.telemetry.record_hook_metrics(raw_len, delivered_len);
             let kind_tag = match coverage {
                 ReadCoverage::Micro => "MICRO",
                 ReadCoverage::FullFile => "FULL_FILE",
@@ -644,13 +627,12 @@ async fn execute_macro_post_read(
             };
 
             let log_msg = format!(
-                "[{kind_tag}] PostReadHook served ({:?}): '{}'{} | raw: {} B | delivered: {} B | reduction: {:.1}% | latency: {:.1}ms",
+                "[{kind_tag}] PostReadHook served ({:?}): '{}'{} | raw: {} B | delivered: {} B | latency: {:.1}ms",
                 packed.disposition,
                 file.display(),
                 range_str,
                 raw_len,
                 delivered_len,
-                pct,
                 elapsed_us as f64 / 1000.0,
             );
             state.log_manager.log_daemon(&log_msg);
@@ -786,14 +768,13 @@ async fn handle_distill_request(params: DistillParams<'_>, state: &ServerState) 
             let elapsed_us = req_start.elapsed().as_micros();
             let content = bundle.format_with(params.format).unwrap_or_default();
             let delivered_len = content.len() as u64;
-            let pct = state.telemetry.record_reduction(raw_len, delivered_len);
+            state.telemetry.record_hook_metrics(raw_len, delivered_len);
             let log_msg = format!(
-                "Distill served: '{}' (mode: {:?}) | raw: {} B | delivered: {} B | reduction: {:.1}% | latency: {:.1}ms",
+                "Distill served: '{}' (mode: {:?}) | raw: {} B | delivered: {} B | latency: {:.1}ms",
                 file.display(),
                 params.mode,
                 raw_len,
                 delivered_len,
-                pct,
                 elapsed_us as f64 / 1000.0,
             );
             state.log_manager.log_daemon(&log_msg);
@@ -882,7 +863,7 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
         "Isolated Workspace".to_string()
     };
 
-    let (hooks, raw, delivered, saved, pct, est_tokens) = state.telemetry.snapshot();
+    let (hooks, raw, delivered) = state.telemetry.snapshot();
     let supp_tokens = delivered / cortx_core::span::EST_BYTES_PER_TOKEN;
     DaemonStatusInfo {
         protocol_version: PROTOCOL_VERSION,
@@ -910,9 +891,6 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
         ast_drops: state.telemetry.ast_drops.load(Ordering::Relaxed),
         raw_bytes_served: raw,
         delivered_bytes_served: delivered,
-        bytes_saved: saved,
-        token_reduction_pct: pct,
-        est_tokens_saved: est_tokens,
         macro_reads: state.telemetry.macro_reads.load(Ordering::Relaxed),
         micro_reads: state.telemetry.micro_reads.load(Ordering::Relaxed),
         omitted_micro_reads: state.telemetry.omitted_micro_reads.load(Ordering::Relaxed),
@@ -994,10 +972,10 @@ async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Resul
                 write_message(&mut stream, &resp).await?;
             }
             DaemonRequest::Shutdown => {
-                let (hooks, raw, delivered, saved, pct, est_tokens) = state.telemetry.snapshot();
+                let (hooks, raw, delivered) = state.telemetry.snapshot();
                 state.log_manager.log_daemon(&format!(
-                    "Daemon stopping: hooks_served={}, raw_bytes={}, delivered_bytes={}, bytes_saved={} ({:.1}%), est_tokens_saved={}",
-                    hooks, raw, delivered, saved, pct, est_tokens
+                    "Daemon stopping: hooks_served={}, raw_bytes={}, delivered_bytes={}",
+                    hooks, raw, delivered
                 ));
                 write_message(&mut stream, &DaemonResponse::ShutdownAck).await?;
                 state.token.cancel();
@@ -1013,22 +991,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_server_telemetry_reduction_and_bounds() {
+    fn test_server_telemetry_metrics() {
         let telemetry = ServerTelemetry::default();
-        let pct = telemetry.record_reduction(1000, 200);
-        assert!((pct - 80.0).abs() < 0.001);
+        telemetry.record_hook_metrics(1000, 200);
+        telemetry.record_hook_metrics(50, 100);
 
-        // Edge case: delivered > raw reflects negative reduction and deducts from net savings
-        let pct2 = telemetry.record_reduction(50, 100);
-        assert!((pct2 - (-100.0)).abs() < 0.001);
-
-        let (hooks, raw, delivered, saved, cumulative_pct, tokens) = telemetry.snapshot();
+        let (hooks, raw, delivered) = telemetry.snapshot();
         assert_eq!(hooks, 2);
         assert_eq!(raw, 1050);
         assert_eq!(delivered, 300);
-        assert_eq!(saved, 750);
-        assert!((cumulative_pct - (750.0 / 1050.0 * 100.0)).abs() < 0.001);
-        assert_eq!(tokens, 187);
     }
 
     #[tokio::test]
@@ -1040,7 +1011,7 @@ mod tests {
             let t = Arc::clone(&telemetry);
             handles.push(tokio::spawn(async move {
                 for _ in 0..100 {
-                    t.record_reduction(100, 20);
+                    t.record_hook_metrics(100, 20);
                 }
             }));
         }
@@ -1049,13 +1020,10 @@ mod tests {
             h.await.unwrap();
         }
 
-        let (hooks, raw, delivered, saved, pct, tokens) = telemetry.snapshot();
+        let (hooks, raw, delivered) = telemetry.snapshot();
         assert_eq!(hooks, 1600);
         assert_eq!(raw, 160_000);
         assert_eq!(delivered, 32_000);
-        assert_eq!(saved, 128_000);
-        assert!((pct - 80.0).abs() < 0.001);
-        assert_eq!(tokens, 32_000);
     }
 
     #[tokio::test]

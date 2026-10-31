@@ -339,7 +339,7 @@ func (s *Suite) BenchmarkOperation(b *testing.B) {
     }
 
     #[test]
-    fn test_go_distill_throughput_and_token_reduction() {
+    fn test_go_distill_throughput_and_skeleton_size() {
         let mut large_go = String::from("package monolithic\n\n");
         for i in 0..100 {
             large_go.push_str(&format!(
@@ -389,12 +389,12 @@ func (h *Handler{i}) Process(ctx context.Context, input string) (string, error) 
             duration
         );
 
-        // Token reduction > 70%
-        let reduction = (large_go.len() - skeleton.len()) as f64 / large_go.len() as f64 * 100.0;
+        // Skeleton compression > 70%
+        let size_ratio = (large_go.len() - skeleton.len()) as f64 / large_go.len() as f64 * 100.0;
         assert!(
-            reduction > 70.0,
-            "Expected >70% reduction, got {:.1}%",
-            reduction
+            size_ratio > 70.0,
+            "Expected >70% skeleton size reduction, got {:.1}%",
+            size_ratio
         );
         assert!(skeleton.contains("type Handler0 struct"));
         assert!(skeleton.contains(

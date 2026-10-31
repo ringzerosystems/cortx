@@ -257,7 +257,6 @@ async fn claude_micro_read_records_exact_distill_bytes() {
     assert_eq!(status.hooks_served, 1);
     assert_eq!(status.raw_bytes_served, (30 * LINE_BYTE_LEN) as u64);
     assert_eq!(status.delivered_bytes_served, 0);
-    assert_eq!(status.bytes_saved, (30 * LINE_BYTE_LEN) as u64);
     assert_eq!(status.submissions, 0);
     assert_eq!(status.micro_reads, 1);
     assert!(status.omitted_micro_reads >= 1);
@@ -339,7 +338,6 @@ async fn claude_omitted_bounds_apply_eof_and_token_cap() {
     assert_eq!(status.workspaces.len(), 1);
     assert_eq!(status.raw_bytes_served, 100_000);
     assert_eq!(status.delivered_bytes_served, 0);
-    assert_eq!(status.bytes_saved, 100_000);
     assert_file_unchanged(&harness.sample_file, &harness.original_content);
     assert_mtime_unchanged(&harness.sample_file, mtime_before);
 
@@ -411,7 +409,6 @@ async fn agy_micro_read_records_exact_distill_bytes() {
     assert_eq!(status.hooks_served, 1);
     assert_eq!(status.raw_bytes_served, expected_bytes);
     assert_eq!(status.delivered_bytes_served, 0);
-    assert_eq!(status.bytes_saved, expected_bytes);
     assert_eq!(status.submissions, 0);
     assert_eq!(status.micro_reads, 1);
     assert!(status.omitted_micro_reads >= 1);

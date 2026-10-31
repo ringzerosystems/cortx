@@ -1,16 +1,21 @@
 ---
 name: cortx-stress
 description: >-
-  Runs high-throughput concurrent stress tests against the running cortx daemon,
-  automatically discovering all target project directories declared in the system
-  cortx.toml configuration. Use whenever the user asks to stress test the daemon,
-  benchmark daemon throughput, generate load, or profile daemon performance across
-  configured workspaces.
+  Builds and previews high-throughput concurrent stress test commands against the running cortx daemon,
+  discovering target project directories from cortx.toml, and executing load tests upon user confirmation.
 ---
 
 # `cortx-stress`
 
 Automated high-throughput load and stress testing workflow for `cortx daemon`. Dynamically discovers project directories from `cortx.toml` (`~/.config/cortx/cortx.toml`) and runs [scripts/stress-test-daemon.py](../../../scripts/stress-test-daemon.py).
+
+> [!IMPORTANT]
+> **Execution Rule: Build Command & Await Confirmation**
+> When invoked (e.g. via `/cortx-stress`):
+> 1. Probe daemon liveness and status (`cargo cortx daemon --ping` or `--status`).
+> 2. Run `./.agents/skills/cortx-stress/scripts/run-stress.py --dry-run` to resolve project directories and construct the execution command.
+> 3. Present the discovered workspaces, proposed parameters (duration, threads, mode, vendor), and the exact command to the user.
+> 4. **Halt and wait for explicit user confirmation before executing any stress test or profiler.**
 
 ## Quick Start
 
@@ -69,7 +74,7 @@ Whenever profiling is executed via [scripts/profile-daemon.sh](../../../scripts/
 - **Collapsed Stack Traces:** `<output-dir>/profile-stacks.txt`
   - Collapsed stacks ready for flamegraph generators.
 - **Daemon Telemetry Snapshot:** `<output-dir>/daemon-telemetry.txt`
-  - Captures pre- and post-run memory RSS, hook counts, and context savings.
+  - Captures pre- and post-run memory RSS, hook counts, and delivered supplemental context.
 - **Raw Perf Recording:** `<output-dir>/perf.data`
   - Raw Linux perf events for deep interactive inspection via `perf report -i <output-dir>/perf.data`.
 

@@ -552,7 +552,7 @@ export function getRole(role: UserRole): string {
     }
 
     #[test]
-    fn test_tsx_distill_throughput_and_token_reduction() {
+    fn test_tsx_distill_throughput_and_skeleton_size() {
         let mut source = String::new();
         source.push_str("import React, { useState } from 'react';\n\n");
         source.push_str("export interface ItemProps { id: string; name: string; }\n\n");
@@ -571,12 +571,12 @@ export function getRole(role: UserRole): string {
 
         let raw_len = source.len();
         let skeleton_len = skeleton.len();
-        let reduction = (raw_len - skeleton_len) as f64 / raw_len as f64 * 100.0;
+        let size_ratio = (raw_len - skeleton_len) as f64 / raw_len as f64 * 100.0;
 
         assert!(
-            reduction > 75.0,
-            "Expected > 75% reduction, got {:.2}%",
-            reduction
+            size_ratio > 75.0,
+            "Expected > 75% skeleton size reduction, got {:.2}%",
+            size_ratio
         );
         // Ensure parsing is sub-millisecond in release, and well within 15ms in debug
         assert!(

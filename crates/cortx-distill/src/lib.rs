@@ -84,7 +84,6 @@ pub fn distill_with_query(
             contracts: Vec::new(),
             callers: Vec::new(),
             callees: Vec::new(),
-            token_reduction_pct: 0.0,
             cross_boundary: None,
             unread_outline: None,
             omitted_callers: 0,
@@ -100,7 +99,6 @@ pub fn distill_with_query(
             &owned_source
         }
     };
-    let raw_len = raw_source.len().max(1);
 
     let ext = query
         .file_path
@@ -113,13 +111,6 @@ pub fn distill_with_query(
     let effective_omit_tests = if is_target_test { false } else { omit_tests };
 
     let skeleton = resolve_or_cache_skeleton(query, &view, raw_source, effective_omit_tests)?;
-    let skeleton_len = skeleton.len();
-
-    let reduction_pct = if raw_len > skeleton_len {
-        ((raw_len - skeleton_len) as f64 / raw_len as f64) * 100.0
-    } else {
-        0.0
-    };
 
     let target_name = query
         .file_path
@@ -201,7 +192,6 @@ pub fn distill_with_query(
         contracts,
         callers,
         callees,
-        token_reduction_pct: reduction_pct,
         cross_boundary,
         unread_outline,
         omitted_callers,
@@ -855,7 +845,6 @@ mod tests {
         assert!(bundle.skeleton.contains("pub struct Worker"));
         assert!(bundle.skeleton.contains("pub fn run(&self)"));
         assert!(!bundle.skeleton.contains("Heavy iteration"));
-        assert!(bundle.token_reduction_pct > 30.0);
     }
 
     #[test]
@@ -882,7 +871,6 @@ mod tests {
         );
         let md = bundle.format_markdown();
         assert!(md.contains("```typescript"));
-        assert!(bundle.token_reduction_pct > 0.0);
     }
 
     #[test]
@@ -952,7 +940,6 @@ mod tests {
 
         let md = bundle.format_markdown();
         assert!(md.contains("```go"));
-        assert!(bundle.token_reduction_pct > 0.0);
         assert!(md.contains("## Cross-Boundary Impact"));
         assert!(md.contains("Go Backend Model:"));
     }

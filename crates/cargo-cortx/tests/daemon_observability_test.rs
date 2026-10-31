@@ -162,9 +162,6 @@ impl Runner for Service {
     assert!(status_info.total_symbols >= 2);
     assert_eq!(status_info.pid, std::process::id());
     assert_eq!(status_info.hooks_served, 0);
-    assert_eq!(status_info.bytes_saved, 0);
-    assert_eq!(status_info.token_reduction_pct, 0.0);
-    assert_eq!(status_info.est_tokens_saved, 0);
     assert_eq!(status_info.macro_reads, 0);
     assert_eq!(status_info.micro_reads, 0);
     assert_eq!(status_info.supplemental_context_bytes, 0);
@@ -213,9 +210,6 @@ impl Runner for Service {
     assert_eq!(post_status_info.hooks_served, 1);
     assert!(post_status_info.raw_bytes_served > 0);
     assert!(post_status_info.delivered_bytes_served > 0);
-    assert!(post_status_info.bytes_saved > 0);
-    assert!(post_status_info.token_reduction_pct > 0.0);
-    assert!(post_status_info.est_tokens_saved > 0);
     assert_eq!(post_status_info.macro_reads, 1);
     assert_eq!(post_status_info.micro_reads, 0);
     assert!(post_status_info.supplemental_context_bytes > 0);
@@ -571,9 +565,6 @@ impl Calculator for SimpleCalc {
                         ast_drops: 0,
                         raw_bytes_served: 0,
                         delivered_bytes_served: 0,
-                        bytes_saved: 0,
-                        token_reduction_pct: 0.0,
-                        est_tokens_saved: 0,
                         macro_reads: 0,
                         micro_reads: 0,
                         omitted_micro_reads: 0,

@@ -6,7 +6,7 @@ tool for the cortx indexing daemon.
 Exercises the daemon wire protocol v2 over Unix domain sockets, testing concurrent
 Distill (AST skeleton stripping, caller/callee hierarchy, trait contracts, bundle),
 PostReadHook, Ping, and Status requests. Measures end-to-end request latency,
-throughput (req/s), data transfer rates, memory stability, and context bloat reduction.
+throughput (req/s), data transfer rates, memory stability, and advisory context metrics.
 """
 
 from __future__ import annotations
@@ -809,9 +809,6 @@ def main() -> None:
                 "final_rss_mb": final_status.get("memory_rss_mb", 0),
                 "rss_delta_mb": round(final_status.get("memory_rss_mb", 0) - initial_status.get("memory_rss_mb", 0), 2),
                 "hooks_served_delta": final_status.get("hooks_served", 0) - initial_status.get("hooks_served", 0),
-                "bytes_saved_delta": final_status.get("bytes_saved", 0) - initial_status.get("bytes_saved", 0),
-                "token_reduction_pct": final_status.get("token_reduction_pct", 0.0),
-                "est_tokens_saved": final_status.get("est_tokens_saved", 0),
             }
         print(json.dumps(result_payload, indent=2))
         return
@@ -850,23 +847,16 @@ def main() -> None:
             cat_rps = len(lats) / total_time if total_time > 0 else 0
             print(f"  [{cat.upper():<7}] {len(lats):>5} reqs ({cat_rps:>6.1f} req/s) | p50: {cat_pct['p50']:>5.2f} ms | p95: {cat_pct['p95']:>5.2f} ms | avg: {cat_pct['avg']:>5.2f} ms")
 
-    # Daemon Telemetry & Context Bloat Reduction
+    # Daemon Telemetry
     if initial_status and final_status:
         init_rss = initial_status.get("memory_rss_mb", 0.0)
         final_rss = final_status.get("memory_rss_mb", 0.0)
         rss_delta = final_rss - init_rss
         hooks_delta = final_status.get("hooks_served", 0) - initial_status.get("hooks_served", 0)
-        saved_delta = final_status.get("bytes_saved", 0) - initial_status.get("bytes_saved", 0)
-        reduction_pct = final_status.get("token_reduction_pct", 0.0)
-        est_tokens = final_status.get("est_tokens_saved", 0)
 
-        print("\n--- Daemon Telemetry & Context Reduction ---")
+        print("\n--- Daemon Telemetry ---")
         print(f"Process Resident Memory: {init_rss:.1f} MB -> {final_rss:.1f} MB (delta: {rss_delta:+.2f} MB)")
         print(f"Hooks / Queries Served:  +{hooks_delta:,} requests in session")
-        if saved_delta > 0 or reduction_pct > 0:
-            print(f"Cumulative Bytes Saved:  +{saved_delta / 1024:.1f} KB")
-            print(f"Token Reduction Ratio:   {reduction_pct:.1f}%")
-            print(f"Estimated Tokens Saved:  ~{est_tokens:,} LLM tokens")
 
     if all_errors:
         print("\n--- Error Summary (Sample) ---")

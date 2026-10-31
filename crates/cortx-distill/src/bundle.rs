@@ -85,8 +85,6 @@ pub struct DistillBundle {
     pub callers: Vec<CallEdge>,
     /// Downstream callees invoked by this module/symbol.
     pub callees: Vec<CallEdge>,
-    /// Estimated context token reduction percentage compared to raw source.
-    pub token_reduction_pct: f64,
     /// Cross-boundary contract impact between Rust backend and TypeScript frontend.
     #[serde(default)]
     pub cross_boundary: Option<CrossBoundaryImpact>,
@@ -116,8 +114,7 @@ impl DistillBundle {
     /// Returns a copy of the distill bundle with upstream callers and downstream dependencies stripped.
     ///
     /// Retains the type skeleton, trait contracts, and cross-boundary impact while zeroing
-    /// out call-graph edges (`callers` and `callees`). The skeleton-based `token_reduction_pct`
-    /// (raw source length vs skeleton length) is preserved.
+    /// out call-graph edges (`callers` and `callees`).
     #[must_use]
     pub fn without_call_graph(&self) -> Self {
         Self {
@@ -126,7 +123,6 @@ impl DistillBundle {
             contracts: self.contracts.clone(),
             callers: Vec::new(),
             callees: Vec::new(),
-            token_reduction_pct: self.token_reduction_pct,
             cross_boundary: self.cross_boundary.clone(),
             unread_outline: self.unread_outline.clone(),
             omitted_callers: 0,
@@ -745,7 +741,6 @@ mod tests {
                 file: "src/service.rs".to_string(),
                 call_line: 0,
             }],
-            token_reduction_pct: 72.5,
             cross_boundary: Some(CrossBoundaryImpact {
                 symbol: "UserService".to_string(),
                 rust_definition: Some("src/service.rs:10".to_string()),
@@ -771,7 +766,6 @@ mod tests {
         assert_eq!(pruned.contracts, bundle.contracts);
         assert!(pruned.callers.is_empty());
         assert!(pruned.callees.is_empty());
-        assert_eq!(pruned.token_reduction_pct, bundle.token_reduction_pct);
         assert_eq!(pruned.cross_boundary, bundle.cross_boundary);
 
         let pruned_md = pruned.format_markdown();
@@ -810,7 +804,6 @@ mod tests {
                 call_line: 0,
             }],
             callees: vec![],
-            token_reduction_pct: 50.0,
             cross_boundary: None,
             unread_outline: None,
             omitted_callers: 0,
@@ -853,7 +846,6 @@ mod tests {
             contracts: vec![],
             callers,
             callees: vec![],
-            token_reduction_pct: 50.0,
             cross_boundary: None,
             unread_outline: None,
             omitted_callers: 0,
@@ -888,7 +880,6 @@ mod tests {
                 call_line: 12,
             }],
             callees: vec![],
-            token_reduction_pct: 50.0,
             cross_boundary: None,
             unread_outline: Some("L1: pub fn head();\n".into()),
             omitted_callers: 0,
@@ -910,7 +901,6 @@ mod tests {
             contracts: vec![],
             callers: vec![],
             callees: vec![],
-            token_reduction_pct: 60.0,
             cross_boundary: None,
             unread_outline: None,
             omitted_callers: 0,
@@ -946,7 +936,6 @@ mod tests {
                 file: "src/db.rs".into(),
                 call_line: 105,
             }],
-            token_reduction_pct: 75.0,
             cross_boundary: Some(CrossBoundaryImpact {
                 symbol: "Service".into(),
                 rust_definition: Some("src/service.rs:10".into()),
@@ -996,7 +985,6 @@ mod tests {
             contracts: vec![],
             callers: vec![],
             callees: vec![],
-            token_reduction_pct: 50.0,
             cross_boundary: None,
             unread_outline: Some("L10: pub fn init();\nL50: pub fn teardown();\n".into()),
             omitted_callers: 0,
@@ -1043,7 +1031,6 @@ mod tests {
                 call_line: 10,
             }],
             callees: vec![],
-            token_reduction_pct: 40.0,
             cross_boundary: None,
             unread_outline: Some(big_outline),
             omitted_callers: 0,
@@ -1062,7 +1049,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_markdown_no_token_reduction_and_formats_lines() {
+    fn test_format_markdown_formats_lines() {
         let bundle = DistillBundle {
             target: "src/lib.rs".to_string(),
             skeleton: "pub fn hello();".to_string(),
@@ -1074,7 +1061,6 @@ mod tests {
                 call_line: 99,
             }],
             callees: vec![],
-            token_reduction_pct: 88.0,
             cross_boundary: None,
             unread_outline: None,
             omitted_callers: 5,
@@ -1160,7 +1146,6 @@ mod tests {
                 contracts: Vec::new(),
                 callers,
                 callees,
-                token_reduction_pct: 50.0,
                 cross_boundary: None,
                 unread_outline: None,
                 omitted_callers: 0,
@@ -1251,7 +1236,6 @@ mod tests {
                 contracts,
                 callers,
                 callees,
-                token_reduction_pct: 42.0,
                 cross_boundary,
                 unread_outline,
                 omitted_callers: 0,

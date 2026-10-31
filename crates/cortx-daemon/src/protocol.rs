@@ -183,7 +183,7 @@ pub struct DaemonStatusInfo {
     #[serde(default)]
     pub watcher_active: bool,
 
-    // --- Context Bloat Reduction Telemetry ---
+    // --- Advisory Hook Telemetry ---
     /// Total number of advisory tool hook requests served since daemon startup.
     #[serde(default)]
     pub hooks_served: u64,
@@ -202,15 +202,6 @@ pub struct DaemonStatusInfo {
     /// Total advisory context bytes emitted (skeletons + contracts).
     #[serde(default)]
     pub delivered_bytes_served: u64,
-    /// Cumulative raw bytes saved (raw - delivered, clamped >= 0).
-    #[serde(default)]
-    pub bytes_saved: u64,
-    /// Overall context reduction percentage across all served requests.
-    #[serde(default)]
-    pub token_reduction_pct: f64,
-    /// Estimated LLM tokens saved across all requests (~4 bytes per token).
-    #[serde(default)]
-    pub est_tokens_saved: u64,
     /// Total macro reads served across all workspaces.
     #[serde(default)]
     pub macro_reads: u64,
@@ -379,9 +370,6 @@ mod tests {
             ast_drops: 0,
             raw_bytes_served: 10000,
             delivered_bytes_served: 2000,
-            bytes_saved: 8000,
-            token_reduction_pct: 80.0,
-            est_tokens_saved: 2000,
             macro_reads: 1,
             micro_reads: 2,
             omitted_micro_reads: 1,
@@ -436,9 +424,6 @@ mod tests {
         assert_eq!(decoded.ast_drops, 0);
         assert_eq!(decoded.raw_bytes_served, 0);
         assert_eq!(decoded.delivered_bytes_served, 0);
-        assert_eq!(decoded.bytes_saved, 0);
-        assert_eq!(decoded.token_reduction_pct, 0.0);
-        assert_eq!(decoded.est_tokens_saved, 0);
         assert_eq!(decoded.macro_reads, 0);
         assert_eq!(decoded.micro_reads, 0);
         assert_eq!(decoded.omitted_micro_reads, 0);
