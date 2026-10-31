@@ -439,6 +439,10 @@ mod tests {
             ast_drops: 5,
             macro_reads: 0,
             micro_reads: 0,
+            omitted_micro_reads: 0,
+            omitted_full_read_skeletons: 0,
+            trimmed_advisories: 0,
+            parse_fallbacks: 0,
         };
         let row_zero = format_workspace_registry_row(&ws);
         assert!(row_zero.contains("7"));

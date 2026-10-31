@@ -11,17 +11,16 @@ use cortx_core::diagnostics::{error, info_banner, success};
 use cortx_core::model::DistillMode;
 use cortx_core::output::OutputFormat;
 use cortx_core::span::{
-    AgentVendor, ReadBudgetEnv, ReadKind, ReadSpan, detect_budget_env, parse_hook_stdin,
-    resolve_read_budget,
+    AgentVendor, ReadBudgetEnv, ReadCoverage, ReadKind, ReadSpan, detect_budget_env,
+    parse_hook_stdin, resolve_read_budget,
 };
 use cortx_core::workspace::{
     resolve_active_socket, resolve_connected_socket, resolve_global_socket, resolve_workspace_root,
 };
 use cortx_daemon::{
-    DaemonRequest, DaemonResponse, ServerOptions, execute_post_read_bundle,
-    run_server_with_options, send_daemon_request,
+    DaemonRequest, DaemonResponse, ServerOptions, run_server_with_options, send_daemon_request,
 };
-use cortx_distill::{SymbolIndex, distill_target_for_project};
+use cortx_distill::{DistillQuery, OverlayView, SymbolIndex, distill_with_query};
 
 mod status_fmt;
 pub(crate) use status_fmt::*;
@@ -136,6 +135,18 @@ pub struct DistillArgs {
     /// Query cross-boundary impact between Rust/Go backend and TypeScript frontend
     #[arg(long, help_heading = "Cross-Boundary Analysis")]
     pub cross_boundary: bool,
+
+    /// 1-indexed inclusive start line
+    #[arg(long, help_heading = "Distillation Options")]
+    pub start_line: Option<usize>,
+
+    /// 1-indexed inclusive end line
+    #[arg(long, help_heading = "Distillation Options")]
+    pub end_line: Option<usize>,
+
+    /// Agent vendor for default read window bounds (claude, agy, opencode, generic)
+    #[arg(long, value_enum, help_heading = "Distillation Options")]
+    pub vendor: Option<AgentVendor>,
 }
 
 #[derive(Args, Debug, Default, Clone)]
@@ -267,13 +278,43 @@ async fn handle_distill(
     args: DistillArgs,
     cfg: &CortxConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut index = SymbolIndex::new();
     let raw_parent = args
         .target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let parent = std::fs::canonicalize(raw_parent).unwrap_or_else(|_| raw_parent.to_path_buf());
+    let socket_override = cfg.daemon.socket_path.as_deref();
+    let connected_socket = resolve_connected_socket(socket_override, &parent);
+
+    if let Some(ref hook_socket) = connected_socket {
+        if let Ok(resp) = send_daemon_request(
+            hook_socket,
+            DaemonRequest::Distill {
+                file: args.target.clone(),
+                mode: args.mode,
+                format: args.format,
+                start_line: args.start_line,
+                end_line: args.end_line,
+                vendor: args.vendor,
+                cross_boundary: args.cross_boundary,
+            },
+        )
+        .await
+        {
+            match resp {
+                DaemonResponse::DistillResult { content } => {
+                    println!("{}", content);
+                    return Ok(());
+                }
+                DaemonResponse::Error { message } => {
+                    tracing::warn!("Daemon distill returned error: {}", message);
+                }
+                _ => {}
+            }
+        }
+    }
+
     let ws_root = resolve_workspace_root(&parent);
     let mut proj = cfg
         .find_project_for_path(&args.target)
@@ -283,12 +324,36 @@ async fn handle_distill(
     if args.depth != 2 {
         proj.distill.max_call_depth = args.depth;
     }
+    let mut index = SymbolIndex::new();
     let _ = index.index_directory_with_project(&parent, &proj);
     if index.symbols_map.is_empty() && parent != ws_root {
         let _ = index.index_directory_with_project(&ws_root, &proj);
     }
-    let bundle =
-        distill_target_for_project(&args.target, args.mode, Some(&index), None, Some(&proj))?;
+    let span = if args.start_line.is_some() || args.end_line.is_some() || args.vendor.is_some() {
+        Some(ReadSpan {
+            start_line: args.start_line,
+            end_line: args.end_line,
+            vendor: args.vendor,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+    let view = OverlayView {
+        base: Some(&index),
+        overlay: None,
+        shadowed_files: None,
+    };
+    let query = DistillQuery {
+        file_path: &args.target,
+        mode: args.mode,
+        coverage: ReadCoverage::PartialMacro,
+        span,
+        preloaded_source: None,
+        cross_boundary: args.cross_boundary,
+        project_cfg: Some(&proj),
+    };
+    let bundle = distill_with_query(&query, view)?;
     let output = bundle.format_with(args.format)?;
     println!("{}", output);
     Ok(())
@@ -404,6 +469,14 @@ async fn handle_daemon_status(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match send_daemon_request(socket_path, DaemonRequest::Status).await {
         Ok(DaemonResponse::Status(status)) => {
+            if status.protocol_version != cortx_daemon::PROTOCOL_VERSION {
+                eprintln!(
+                    "[Daemon] Warning: daemon on '{}' is running protocol version {} (CLI expects protocol version {}). Restart daemon with 'cargo cortx daemon --stop'.",
+                    socket_path.display(),
+                    status.protocol_version,
+                    cortx_daemon::PROTOCOL_VERSION
+                );
+            }
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
@@ -574,13 +647,53 @@ async fn handle_daemon_hook_post_read(
         error("Daemon", "--file is required when running post-read hook");
         return Ok(());
     };
-    let budget_env = detect_budget_env(|k| std::env::var(k).ok());
-    let (start_line, end_line, raw_read_bytes) =
-        compute_hook_read_metrics(&file, &span, &budget_env);
 
-    let total_lines = std::fs::read_to_string(&file)
-        .map(|c| c.split_inclusive('\n').count())
-        .unwrap_or(0);
+    // Short-circuit explicit bounded spans <= 150 lines at CLI boundary: immediately return "" (<0.5 ms).
+    if span
+        .effective_line_count(None)
+        .is_some_and(|l| l <= cortx_core::MICRO_READ_MAX_LINES)
+    {
+        return Ok(());
+    }
+
+    let budget_env = detect_budget_env(|k| std::env::var(k).ok());
+    // Perform at most 1 client-side file read on macro reads: compute metrics once
+    let preloaded_source = std::fs::read_to_string(&file).ok();
+    let (total_lines, raw_read_bytes, start_line, end_line, effective_vendor, coverage) =
+        if let Some(ref content) = preloaded_source {
+            let tot_lines = content.split_inclusive('\n').count();
+            let eff_vendor = span.vendor.or(budget_env.env_vendor);
+            let mut eff_span = span.clone();
+            if span.vendor.is_none() && eff_vendor.is_some() {
+                eff_span.vendor = eff_vendor;
+            }
+            let (start, end) = eff_span.effective_range(tot_lines);
+            let raw_bytes = resolve_read_budget(&span, content, &budget_env);
+            let cov = cortx_core::classify_read_coverage(
+                &span,
+                Some(tot_lines),
+                Some(raw_bytes),
+                &budget_env,
+            );
+            (
+                tot_lines,
+                Some(raw_bytes),
+                (start > 0).then_some(start),
+                (end > 0).then_some(end),
+                eff_vendor,
+                cov,
+            )
+        } else {
+            let (st, en, raw) = compute_hook_read_metrics(&file, &span, &budget_env);
+            let cov = cortx_core::classify_read_coverage(&span, None, raw, &budget_env);
+            (0, raw, st, en, span.vendor.or(budget_env.env_vendor), cov)
+        };
+
+    if coverage == ReadCoverage::Micro {
+        return Ok(());
+    }
+
+    let is_full_read = coverage == ReadCoverage::FullFile;
     let read_kind = span.classify(total_lines);
 
     let target_dir = if let Some(parent) = file.parent() {
@@ -596,10 +709,11 @@ async fn handle_daemon_hook_post_read(
 
     let mut advisory: Option<String> = None;
     let mut provenance: Option<String> = None;
+    let mut fallback_reason: Option<&'static str> = None;
     let start_time = std::time::Instant::now();
 
     if let Some(ref hook_socket) = connected_socket {
-        if let Ok(resp) = send_daemon_request(
+        match send_daemon_request(
             hook_socket,
             DaemonRequest::PostReadHook {
                 file: file.clone(),
@@ -607,24 +721,50 @@ async fn handle_daemon_hook_post_read(
                 end_line,
                 raw_read_bytes,
                 read_kind: Some(read_kind),
+                total_lines: Some(total_lines),
+                vendor: effective_vendor,
+                is_full_read: Some(is_full_read),
             },
         )
         .await
         {
-            let latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-            match resp {
-                DaemonResponse::AdvisoryContext { advisory_block, .. } => {
-                    advisory = Some(advisory_block);
-                    provenance = Some(format!(
-                        "<!-- cortx-context-provenance: daemon (socket: {}, latency: {:.1}ms) -->",
-                        hook_socket.display(),
-                        latency_ms
-                    ));
+            Ok(resp) => {
+                let latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                match resp {
+                    DaemonResponse::AdvisoryContext {
+                        advisory_block,
+                        protocol_version,
+                        ..
+                    } => {
+                        if protocol_version == cortx_daemon::PROTOCOL_VERSION {
+                            advisory = Some(advisory_block);
+                            provenance = Some(format!(
+                                "<!-- cortx-context-provenance: daemon (socket: {}, latency: {:.1}ms) -->",
+                                hook_socket.display(),
+                                latency_ms
+                            ));
+                        } else {
+                            eprintln!(
+                                "[Daemon] Warning: daemon on '{}' is running protocol version {} (CLI expects protocol version {}); falling back to in-process distillation",
+                                hook_socket.display(),
+                                protocol_version,
+                                cortx_daemon::PROTOCOL_VERSION
+                            );
+                            fallback_reason = Some("protocol mismatch");
+                        }
+                    }
+                    DaemonResponse::Error { message } => {
+                        tracing::warn!("Daemon hook returned error: {}", message);
+                    }
+                    _ => {}
                 }
-                DaemonResponse::Error { message } => {
-                    tracing::warn!("Daemon hook returned error: {}", message);
-                }
-                _ => {}
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed communicating with daemon on '{}': {}",
+                    hook_socket.display(),
+                    e
+                );
             }
         }
     }
@@ -632,16 +772,21 @@ async fn handle_daemon_hook_post_read(
     let (output, prov) = match advisory {
         Some(adv) => (adv, provenance.unwrap_or_default()),
         None => {
-            let fallback_prov =
-                "<!-- cortx-context-provenance: in-process-fallback (daemon unreachable) -->"
-                    .to_string();
-            let adv = execute_in_process_fallback(
-                &file,
+            let reason = fallback_reason.unwrap_or("daemon unreachable");
+            let fallback_prov = format!(
+                "<!-- cortx-context-provenance: in-process-fallback ({}) -->",
+                reason
+            );
+            let params = FallbackParams {
+                file: &file,
                 start_line,
                 end_line,
-                raw_read_bytes,
                 read_kind,
-            )?;
+                preloaded_source: preloaded_source.as_deref(),
+                coverage,
+                vendor: effective_vendor,
+            };
+            let adv = execute_in_process_fallback(params)?;
             (adv, fallback_prov)
         }
     };
@@ -655,63 +800,73 @@ async fn handle_daemon_hook_post_read(
     Ok(())
 }
 
-fn execute_in_process_fallback(
-    file: &Path,
+struct FallbackParams<'a> {
+    file: &'a Path,
     start_line: Option<usize>,
     end_line: Option<usize>,
-    raw_read_bytes: Option<u64>,
     read_kind: ReadKind,
+    preloaded_source: Option<&'a str>,
+    coverage: ReadCoverage,
+    vendor: Option<AgentVendor>,
+}
+
+fn execute_in_process_fallback(
+    params: FallbackParams<'_>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let kind_tag = match read_kind {
+    let kind_tag = match params.read_kind {
         ReadKind::Macro => "MACRO",
         ReadKind::Micro => "MICRO",
     };
     tracing::warn!(
         "[{kind_tag}] Daemon offline or unreachable, falling back to in-process distillation"
     );
-    let bundle = execute_post_read_bundle(file, None)?;
-    let budget = raw_read_bytes.unwrap_or_else(|| std::fs::metadata(file).map_or(0, |m| m.len()));
-    let fitted = bundle.fit_to_budget(budget);
-    match fitted.stage {
-        cortx_distill::BudgetStage::Full => {
-            let range_str = format_range(start_line, end_line);
-            tracing::info!(
-                "[{kind_tag}] PostReadHook served advisory context ({} B) for '{}'{}",
-                fitted.pruned_len,
-                file.display(),
-                range_str
-            );
+    let span = if params.start_line.is_some() || params.end_line.is_some() || params.vendor.is_some() {
+        Some(ReadSpan {
+            start_line: params.start_line,
+            end_line: params.end_line,
+            vendor: params.vendor,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+
+    let owned_source;
+    let source = match params.preloaded_source {
+        Some(s) => s,
+        None => {
+            owned_source = std::fs::read_to_string(params.file).unwrap_or_default();
+            &owned_source
         }
-        cortx_distill::BudgetStage::CallGraphPruned => {
-            let full_len = fitted.full_len.unwrap_or(fitted.pruned_len);
-            let reduction = if budget > 0 {
-                ((budget as f64 - fitted.pruned_len as f64) / budget as f64) * 100.0
-            } else {
-                0.0
-            };
-            let range_str = format_range(start_line, end_line);
-            tracing::warn!(
-                "[{kind_tag}] PostReadHook pruned call graph: bundle ({} B) >= read request ({} B), retained skeleton ({} B, {:.1}% reduction) for '{}'{}",
-                full_len,
-                budget,
-                fitted.pruned_len,
-                reduction,
-                file.display(),
-                range_str
-            );
-        }
-        cortx_distill::BudgetStage::Dropped => {
-            let range_str = format_range(start_line, end_line);
-            tracing::warn!(
-                "[{kind_tag}] PostReadHook dropped all advisory context: skeleton ({} B) >= read request ({} B) for '{}'{}",
-                fitted.pruned_len,
-                budget,
-                file.display(),
-                range_str
-            );
-        }
-    }
-    Ok(fitted.markdown)
+    };
+
+    let mut index = SymbolIndex::new();
+    let _ = index.index_any_source_str(&params.file.to_string_lossy(), source);
+
+    let query = DistillQuery {
+        file_path: params.file,
+        mode: DistillMode::Bundle,
+        coverage: params.coverage,
+        span,
+        preloaded_source: Some(source),
+        cross_boundary: true,
+        project_cfg: None,
+    };
+    let view = OverlayView {
+        base: Some(&index),
+        overlay: None,
+        shadowed_files: None,
+    };
+    let bundle = cortx_daemon::execute_post_read_query(&query, view)?;
+    let packed = bundle.pack_for_hook(params.coverage);
+    let range_str = format_range(params.start_line, params.end_line);
+    tracing::info!(
+        "[{kind_tag}] PostReadHook served fallback advisory context ({} B) for '{}'{}",
+        packed.markdown.len(),
+        params.file.display(),
+        range_str
+    );
+    Ok(packed.markdown)
 }
 
 async fn handle_daemon_start(
@@ -897,11 +1052,77 @@ mod tests {
             .suffix(".rs")
             .tempfile()
             .expect("create temp file");
-        std::fs::write(tmp.path(), "pub fn test_hello() -> bool { true }\n").expect("write file");
-        let result =
-            execute_in_process_fallback(tmp.path(), None, None, Some(10_000), ReadKind::Macro);
+        let content = r#"pub fn head() {
+    println!("1");
+}
+
+pub fn mid() {
+    println!("2");
+}
+
+pub fn tail() {
+    println!("3");
+}
+"#;
+        std::fs::write(tmp.path(), content).expect("write file");
+        let params = FallbackParams {
+            file: tmp.path(),
+            start_line: Some(5),
+            end_line: Some(8),
+            read_kind: ReadKind::Macro,
+            preloaded_source: Some(content),
+            coverage: ReadCoverage::PartialMacro,
+            vendor: None,
+        };
+        let result = execute_in_process_fallback(params);
         assert!(result.is_ok());
         let markdown = result.unwrap();
-        assert!(markdown.contains("test_hello"));
+        assert!(markdown.contains("head"));
+        assert!(markdown.contains("tail"));
+    }
+
+    #[test]
+    fn test_distill_cli_parses_span_and_cross_boundary_flags() {
+        let cli = Cli::try_parse_from([
+            "cargo-cortx",
+            "distill",
+            "src/lib.rs",
+            "--start-line",
+            "15",
+            "--end-line",
+            "50",
+            "--vendor",
+            "claude",
+            "--cross-boundary",
+        ])
+        .expect("should parse CLI flags");
+
+        let Some(Commands::Distill(d)) = cli.command else {
+            panic!("expected Distill command");
+        };
+        assert_eq!(d.target, PathBuf::from("src/lib.rs"));
+        assert_eq!(d.start_line, Some(15));
+        assert_eq!(d.end_line, Some(50));
+        assert_eq!(d.vendor, Some(AgentVendor::Claude));
+        assert!(d.cross_boundary);
+    }
+
+    #[test]
+    fn test_micro_read_bounded_span_detection() {
+        let span = ReadSpan {
+            start_line: Some(10),
+            end_line: Some(50),
+            ..Default::default()
+        };
+        assert_eq!(span.effective_line_count(None), Some(41));
+        assert!(span.effective_line_count(None).unwrap() <= cortx_core::MICRO_READ_MAX_LINES);
+
+        let span_large = ReadSpan {
+            start_line: Some(1),
+            end_line: Some(200),
+            ..Default::default()
+        };
+        assert_eq!(span_large.effective_line_count(None), Some(200));
+        assert!(span_large.effective_line_count(None).unwrap() > cortx_core::MICRO_READ_MAX_LINES);
     }
 }
