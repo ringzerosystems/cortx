@@ -137,7 +137,7 @@ pub fn distill_with_query(
 
     let mut contracts = Vec::new();
     if matches!(query.mode, DistillMode::Contracts | DistillMode::Bundle) {
-        contracts = view.get_contracts(target_name);
+        contracts = collect_contracts_view(&view, query.file_path, &target_defs);
     }
 
     let mut callers = Vec::new();
@@ -310,6 +310,42 @@ fn is_test_call_edge(edge: &CallEdge) -> bool {
 
 pub(crate) fn path_matches(p1: &Path, p2: &Path) -> bool {
     p1 == p2 || p1.ends_with(p2) || p2.ends_with(p1)
+}
+
+fn collect_contracts_view(
+    view: &OverlayView<'_>,
+    target_path: &Path,
+    target_defs: &[SymbolDef],
+) -> Vec<ContractInfo> {
+    let target_name = target_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("target");
+    let mut contracts = view.get_contracts(target_name);
+    let mut seen: HashSet<(String, String, String)> = contracts
+        .iter()
+        .map(|c| (c.trait_name.clone(), c.target_type.clone(), c.file.clone()))
+        .collect();
+
+    if let Some(sym_names) = view.get_file_symbols(target_path) {
+        for sym in sym_names {
+            for c in view.get_contracts(sym) {
+                if seen.insert((c.trait_name.clone(), c.target_type.clone(), c.file.clone())) {
+                    contracts.push(c);
+                }
+            }
+        }
+    }
+    for def in target_defs {
+        if !def.name.is_empty() {
+            for c in view.get_contracts(&def.name) {
+                if seen.insert((c.trait_name.clone(), c.target_type.clone(), c.file.clone())) {
+                    contracts.push(c);
+                }
+            }
+        }
+    }
+    contracts
 }
 
 fn collect_callers_view(
