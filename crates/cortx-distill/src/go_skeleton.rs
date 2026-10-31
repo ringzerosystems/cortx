@@ -382,8 +382,9 @@ func (h *Handler{i}) Process(ctx context.Context, input string) (string, error) 
         let duration = start.elapsed();
 
         // Throughput target: sub-millisecond in release, well within threshold in debug
+        let max_ms = if cfg!(debug_assertions) { 500 } else { 20 };
         assert!(
-            duration.as_millis() < 100,
+            duration.as_millis() < max_ms,
             "Distillation took too long: {:?}",
             duration
         );

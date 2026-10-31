@@ -1135,10 +1135,10 @@ fn test_distill_skeleton_cache_hit_and_mtime_invalidation() {
 
     // 4. Watch batch invalidation on file modification
     let batch_index = SymbolIndex::new();
-    batch_index
-        .skeleton_cache
-        .write()
-        .insert(file_path.clone(), (updated_mtime, std::sync::Arc::from("/* cached */")));
+    batch_index.skeleton_cache.write().insert(
+        file_path.clone(),
+        (updated_mtime, std::sync::Arc::from("/* cached */")),
+    );
     assert_eq!(batch_index.skeleton_cache.read().len(), 1);
 
     let outcome = batch_index.apply_watch_batch(WatchBatchUpdate {

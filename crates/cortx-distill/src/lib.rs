@@ -112,8 +112,7 @@ pub fn distill_with_query(
     let is_target_test = is_test_path(query.file_path);
     let effective_omit_tests = if is_target_test { false } else { omit_tests };
 
-    let skeleton =
-        resolve_or_cache_skeleton(query, &view, raw_source, effective_omit_tests)?;
+    let skeleton = resolve_or_cache_skeleton(query, &view, raw_source, effective_omit_tests)?;
     let skeleton_len = skeleton.len();
 
     let reduction_pct = if raw_len > skeleton_len {
