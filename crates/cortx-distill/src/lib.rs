@@ -43,6 +43,7 @@ pub use cortx_core::model::DistillMode;
 pub use cortx_core::{ReadCoverage, ReadSpan};
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Encapsulates parameters for a context distillation query.
 #[derive(Debug, Clone)]
@@ -112,7 +113,7 @@ pub fn distill_with_query(
     let effective_omit_tests = if is_target_test { false } else { omit_tests };
 
     let skeleton =
-        extract_source_skeleton(raw_source, ext, query.project_cfg, effective_omit_tests)?;
+        resolve_or_cache_skeleton(query, &view, raw_source, effective_omit_tests)?;
     let skeleton_len = skeleton.len();
 
     let reduction_pct = if raw_len > skeleton_len {
@@ -253,6 +254,44 @@ pub fn distill_target_for_project(
         project_cfg: project,
     };
     distill_with_query(&query, view)
+}
+
+fn resolve_or_cache_skeleton(
+    query: &DistillQuery<'_>,
+    view: &OverlayView<'_>,
+    raw_source: &str,
+    omit_tests: bool,
+) -> Result<String, DistillError> {
+    let mtime = if query.preloaded_source.is_none() {
+        std::fs::metadata(query.file_path)
+            .and_then(|m| m.modified())
+            .ok()
+    } else {
+        None
+    };
+
+    if let Some(mtime) = mtime {
+        if let Some(cached) = view.get_cached_skeleton(query.file_path, mtime) {
+            return Ok(cached.to_string());
+        }
+    }
+
+    let ext = query
+        .file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let skeleton = extract_source_skeleton(raw_source, ext, query.project_cfg, omit_tests)?;
+
+    if let Some(mtime) = mtime {
+        view.insert_cached_skeleton(
+            query.file_path.to_path_buf(),
+            mtime,
+            Arc::from(skeleton.as_str()),
+        );
+    }
+
+    Ok(skeleton)
 }
 
 fn extract_source_skeleton(

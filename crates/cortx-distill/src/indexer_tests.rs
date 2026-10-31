@@ -1041,3 +1041,140 @@ fn test_collect_source_files_omit_tests_filtering() {
         ]
     );
 }
+
+#[test]
+fn test_distill_skeleton_cache_hit_and_mtime_invalidation() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("service.rs");
+    std::fs::write(
+        &file_path,
+        r#"
+        pub struct Service {
+            pub id: u64,
+        }
+        impl Service {
+            pub fn run(&self) {
+                println!("Heavy internal implementation");
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let index = SymbolIndex::new();
+
+    // 1. Initial touch: cache miss, extracts skeleton and populates cache
+    let bundle1 = crate::distill_target_with_overlay(
+        &file_path,
+        crate::DistillMode::Bundle,
+        Some(&index),
+        None,
+    )
+    .unwrap();
+    assert!(bundle1.skeleton.contains("pub struct Service"));
+    assert!(bundle1.skeleton.contains("pub fn run(&self)"));
+    assert!(!bundle1.skeleton.contains("Heavy internal implementation"));
+
+    let initial_mtime = {
+        let cache = index.skeleton_cache.read();
+        assert_eq!(cache.len(), 1);
+        let (mt, cached_skel) = cache.get(&file_path).expect("must be cached");
+        assert_eq!(cached_skel.as_ref(), &bundle1.skeleton);
+        *mt
+    };
+
+    // 2. Second touch with sentinel: proves cache hit directly returns cached skeleton without reparsing
+    {
+        let mut cache = index.skeleton_cache.write();
+        cache.insert(
+            file_path.clone(),
+            (
+                initial_mtime,
+                std::sync::Arc::from("/* sentinel cached skeleton */"),
+            ),
+        );
+    }
+
+    let bundle2 = crate::distill_target_with_overlay(
+        &file_path,
+        crate::DistillMode::Bundle,
+        Some(&index),
+        None,
+    )
+    .unwrap();
+    assert_eq!(bundle2.skeleton, "/* sentinel cached skeleton */");
+
+    // 3. File modified on disk: mtime advances, cache miss triggers re-distill
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(
+        &file_path,
+        r#"
+        pub struct UpdatedService {
+            pub new_field: bool,
+        }
+        "#,
+    )
+    .unwrap();
+
+    let bundle3 = crate::distill_target_with_overlay(
+        &file_path,
+        crate::DistillMode::Bundle,
+        Some(&index),
+        None,
+    )
+    .unwrap();
+    assert!(bundle3.skeleton.contains("pub struct UpdatedService"));
+    assert_ne!(bundle3.skeleton, "/* sentinel cached skeleton */");
+
+    let updated_mtime = {
+        let cache = index.skeleton_cache.read();
+        let (mt, _) = cache.get(&file_path).unwrap();
+        *mt
+    };
+    assert_ne!(initial_mtime, updated_mtime);
+
+    // 4. Watch batch invalidation on file modification
+    let batch_index = SymbolIndex::new();
+    batch_index
+        .skeleton_cache
+        .write()
+        .insert(file_path.clone(), (updated_mtime, std::sync::Arc::from("/* cached */")));
+    assert_eq!(batch_index.skeleton_cache.read().len(), 1);
+
+    let outcome = batch_index.apply_watch_batch(WatchBatchUpdate {
+        upserted: std::slice::from_ref(&file_path),
+        removed: &[],
+        project_cfg: None,
+    });
+    assert_eq!(outcome.next_index.skeleton_cache.read().len(), 0);
+}
+
+#[test]
+fn test_distill_skeleton_cache_overlay_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("model.rs");
+    std::fs::write(&file_path, "pub struct Model;").unwrap();
+    let mtime = std::fs::metadata(&file_path).unwrap().modified().unwrap();
+
+    let base_index = SymbolIndex::new();
+    let overlay_index = SymbolIndex::new();
+
+    base_index.skeleton_cache.write().insert(
+        file_path.clone(),
+        (mtime, std::sync::Arc::from("/* base cached */")),
+    );
+    overlay_index.skeleton_cache.write().insert(
+        file_path.clone(),
+        (mtime, std::sync::Arc::from("/* overlay cached */")),
+    );
+
+    let bundle = crate::distill_target_with_overlay(
+        &file_path,
+        crate::DistillMode::Bundle,
+        Some(&base_index),
+        Some(&overlay_index),
+    )
+    .unwrap();
+
+    assert_eq!(bundle.skeleton, "/* overlay cached */");
+}
