@@ -1,11 +1,14 @@
 //! Semantic call-graph, contract, and cross-boundary indexer for polyglot codebases.
 
 use crate::error::DistillError;
+use parking_lot::RwLock;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
 use walkdir::WalkDir;
 
 pub mod go_graph;
@@ -26,6 +29,11 @@ pub use rust_graph::{
 };
 pub use ts_graph::{TsFactOptions, extract_ts_file_facts, normalize_ts_module_path};
 pub use types::*;
+
+/// Distillation skeleton cache entry: (mtime, cached_skeleton).
+pub type SkeletonCacheEntry = (SystemTime, Arc<str>);
+/// Thread-safe in-memory cache for distillation skeletons keyed by file path.
+pub type SkeletonCache = Arc<RwLock<FxHashMap<PathBuf, SkeletonCacheEntry>>>;
 
 /// In-memory semantic index across a codebase.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +60,8 @@ pub struct SymbolIndex {
     pub manifests: std::sync::Arc<WorkspaceManifests>,
     #[serde(skip)]
     pub parse_fallbacks: usize,
+    #[serde(skip, default)]
+    pub skeleton_cache: SkeletonCache,
 }
 
 impl Default for SymbolIndex {
@@ -69,6 +79,7 @@ impl Default for SymbolIndex {
             file_facts: HashMap::default(),
             manifests: std::sync::Arc::new(WorkspaceManifests::discover(Path::new("."), &[])),
             parse_fallbacks: 0,
+            skeleton_cache: Arc::new(RwLock::new(FxHashMap::default())),
         }
     }
 }
@@ -272,6 +283,13 @@ impl SymbolIndex {
             }
         }
         self.file_facts.extend(other.file_facts);
+        let other_cache = other.skeleton_cache.read();
+        if !other_cache.is_empty() {
+            let mut self_cache = self.skeleton_cache.write();
+            for (p, entry) in other_cache.iter() {
+                self_cache.insert(p.clone(), entry.clone());
+            }
+        }
     }
 
     pub fn collect_source_files(&self, root: &Path) -> Vec<PathBuf> {
@@ -906,7 +924,17 @@ impl SymbolIndex {
             }
         }
 
-        let next_index = Self::link_facts(&new_facts, manifests, parse_fallbacks);
+        let mut next_index = Self::link_facts(&new_facts, manifests, parse_fallbacks);
+        {
+            let mut cache = self.skeleton_cache.write();
+            for rem in req.removed {
+                cache.retain(|path, _| !(path == rem || path.starts_with(rem)));
+            }
+            for ups in req.upserted {
+                cache.retain(|path, _| !(path == ups || path.starts_with(ups)));
+            }
+        }
+        next_index.skeleton_cache = Arc::clone(&self.skeleton_cache);
         WatchBatchOutcome {
             next_index,
             parse_fallbacks,

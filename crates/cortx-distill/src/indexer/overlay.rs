@@ -3,6 +3,8 @@
 use super::{CallEdge, ContractInfo, CrossBoundaryImpact, SymbolDef, SymbolIndex};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
 
 /// Worktree overlay union view (`overlay ∪ (base \ shadowed_files)`).
 #[derive(Debug, Clone, Copy)]
@@ -244,5 +246,38 @@ impl<'a> OverlayView<'a> {
             }
         }
         defs
+    }
+
+    /// Looks up a cached distillation skeleton for the given path, validating mtime.
+    pub fn get_cached_skeleton(&self, path: &Path, mtime: SystemTime) -> Option<Arc<str>> {
+        if let Some(ov) = self.overlay {
+            if let Some((cached_mtime, skeleton)) = ov.skeleton_cache.read().get(path) {
+                if *cached_mtime == mtime {
+                    return Some(Arc::clone(skeleton));
+                }
+            }
+        }
+        if !self.is_shadowed_path(path) {
+            if let Some(base_idx) = self.base {
+                if let Some((cached_mtime, skeleton)) = base_idx.skeleton_cache.read().get(path) {
+                    if *cached_mtime == mtime {
+                        return Some(Arc::clone(skeleton));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Inserts a distillation skeleton into the active overlay or base cache.
+    pub fn insert_cached_skeleton(&self, path: PathBuf, mtime: SystemTime, skeleton: Arc<str>) {
+        if let Some(ov) = self.overlay {
+            ov.skeleton_cache.write().insert(path, (mtime, skeleton));
+        } else if let Some(base_idx) = self.base {
+            base_idx
+                .skeleton_cache
+                .write()
+                .insert(path, (mtime, skeleton));
+        }
     }
 }

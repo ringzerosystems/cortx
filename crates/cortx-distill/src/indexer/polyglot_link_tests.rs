@@ -491,3 +491,112 @@ fn run_action_v2() {}
         "Old run_action should have no callers when overlay overrides file"
     );
 }
+
+#[test]
+fn test_skeleton_cache_overlay_precedence_and_invalidation() {
+    let now = std::time::SystemTime::now();
+    let later = now + std::time::Duration::from_secs(5);
+
+    let base_idx = SymbolIndex::new();
+    let overlay_idx = SymbolIndex::new();
+    let mut shadowed = HashSet::new();
+    shadowed.insert(PathBuf::from("crates/core/src/deleted.rs"));
+
+    let view = OverlayView {
+        base: Some(&base_idx),
+        overlay: Some(&overlay_idx),
+        shadowed_files: Some(&shadowed),
+    };
+
+    let base_file = PathBuf::from("crates/core/src/base.rs");
+    let deleted_file = PathBuf::from("crates/core/src/deleted.rs");
+    let shared_file = PathBuf::from("crates/core/src/shared.rs");
+
+    base_idx.skeleton_cache.write().insert(
+        base_file.clone(),
+        (now, std::sync::Arc::from("pub fn base() {}")),
+    );
+    base_idx.skeleton_cache.write().insert(
+        deleted_file.clone(),
+        (now, std::sync::Arc::from("pub fn deleted() {}")),
+    );
+    base_idx.skeleton_cache.write().insert(
+        shared_file.clone(),
+        (now, std::sync::Arc::from("pub fn shared_v1() {}")),
+    );
+
+    // 1. Base cache hit
+    assert_eq!(
+        view.get_cached_skeleton(&base_file, now).as_deref(),
+        Some("pub fn base() {}")
+    );
+
+    // 2. Base cache miss on mtime mismatch
+    assert!(view.get_cached_skeleton(&base_file, later).is_none());
+
+    // 3. Shadowed file in base returns None
+    assert!(view.get_cached_skeleton(&deleted_file, now).is_none());
+
+    // 4. Overlay cache overrides base
+    overlay_idx.skeleton_cache.write().insert(
+        shared_file.clone(),
+        (now, std::sync::Arc::from("pub fn shared_v2() {}")),
+    );
+    assert_eq!(
+        view.get_cached_skeleton(&shared_file, now).as_deref(),
+        Some("pub fn shared_v2() {}")
+    );
+
+    // 5. insert_cached_skeleton writes to overlay if present
+    let new_file = PathBuf::from("crates/core/src/new.rs");
+    view.insert_cached_skeleton(
+        new_file.clone(),
+        now,
+        std::sync::Arc::from("pub fn new() {}"),
+    );
+    assert_eq!(
+        view.get_cached_skeleton(&new_file, now).as_deref(),
+        Some("pub fn new() {}")
+    );
+    assert!(overlay_idx.skeleton_cache.read().contains_key(&new_file));
+    assert!(!base_idx.skeleton_cache.read().contains_key(&new_file));
+}
+
+#[test]
+fn test_skeleton_cache_apply_watch_batch_invalidation() {
+    let now = std::time::SystemTime::now();
+    let idx = SymbolIndex::new();
+    let file1 = PathBuf::from("crates/core/src/lib.rs");
+    let file2 = PathBuf::from("crates/core/src/utils.rs");
+
+    idx.skeleton_cache.write().insert(
+        file1.clone(),
+        (now, std::sync::Arc::from("pub fn lib() {}")),
+    );
+    idx.skeleton_cache.write().insert(
+        file2.clone(),
+        (now, std::sync::Arc::from("pub fn utils() {}")),
+    );
+
+    let req = WatchBatchUpdate {
+        removed: std::slice::from_ref(&file1),
+        upserted: std::slice::from_ref(&file2),
+        project_cfg: None,
+    };
+
+    let outcome = idx.apply_watch_batch(req);
+    assert!(
+        !outcome
+            .next_index
+            .skeleton_cache
+            .read()
+            .contains_key(&file1)
+    );
+    assert!(
+        !outcome
+            .next_index
+            .skeleton_cache
+            .read()
+            .contains_key(&file2)
+    );
+}

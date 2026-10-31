@@ -29,6 +29,7 @@ tree-sitter = { workspace = true }
 tree-sitter-go = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

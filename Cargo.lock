@@ -351,6 +351,7 @@ dependencies = [
  "oxc_parser",
  "oxc_resolver",
  "oxc_span",
+ "parking_lot",
  "prettyplease",
  "proc-macro2",
  "proptest",
