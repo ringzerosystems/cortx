@@ -2,6 +2,7 @@
 
 use crate::error::DistillError;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -32,9 +33,9 @@ pub struct SymbolIndex {
     #[serde(default)]
     pub pool: StringPool,
     #[serde(default)]
-    pub callers_map: HashMap<SymbolId, Vec<CompactCallEdge>>,
+    pub callers_map: FxHashMap<SymbolId, Vec<CompactCallEdge>>,
     #[serde(default)]
-    pub callees_map: HashMap<SymbolId, Vec<CompactCallEdge>>,
+    pub callees_map: FxHashMap<SymbolId, Vec<CompactCallEdge>>,
     pub contracts_map: HashMap<String, Vec<ContractInfo>>,
     pub symbols_map: HashMap<String, Vec<SymbolDef>>,
     #[serde(default)]
@@ -57,8 +58,8 @@ impl Default for SymbolIndex {
     fn default() -> Self {
         Self {
             pool: StringPool::default(),
-            callers_map: HashMap::default(),
-            callees_map: HashMap::default(),
+            callers_map: FxHashMap::default(),
+            callees_map: FxHashMap::default(),
             contracts_map: HashMap::default(),
             symbols_map: HashMap::default(),
             file_to_symbols: HashMap::default(),
@@ -95,15 +96,8 @@ impl SymbolIndex {
             call_line,
         };
 
-        let caller_entry = self.callers_map.entry(callee_id).or_default();
-        if !caller_entry.contains(&edge) {
-            caller_entry.push(edge);
-        }
-
-        let callee_entry = self.callees_map.entry(caller_id).or_default();
-        if !callee_entry.contains(&edge) {
-            callee_entry.push(edge);
-        }
+        self.callers_map.entry(callee_id).or_default().push(edge);
+        self.callees_map.entry(caller_id).or_default().push(edge);
     }
 
     pub fn record_call_edge(&mut self, caller: &str, callee: &str, file: &str) {
@@ -1227,7 +1221,7 @@ impl SymbolIndex {
 
     fn collect_edges_bfs(
         &self,
-        map: &HashMap<SymbolId, Vec<CompactCallEdge>>,
+        map: &FxHashMap<SymbolId, Vec<CompactCallEdge>>,
         next_id_fn: fn(&CompactCallEdge) -> SymbolId,
         symbol: &str,
         depth: usize,
