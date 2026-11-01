@@ -467,25 +467,52 @@ fn distance_to_window(
     }
 }
 
+#[inline]
+fn has_symbol_suffix(target: &str, name: &str) -> bool {
+    if !target.ends_with(name) {
+        return false;
+    }
+    let prefix = &target[..target.len() - name.len()];
+    prefix.ends_with("::") || prefix.ends_with('.')
+}
+
+#[inline]
+fn symbol_matches_def(target: &str, d: &SymbolDef) -> bool {
+    d.name == target || d.qualified_name == target || has_symbol_suffix(target, &d.name)
+}
+
+fn select_top_indices<K: Ord>(keys: &[K], cap: usize) -> Vec<usize> {
+    let total = keys.len();
+    let mut indices: Vec<usize> = (0..total).collect();
+    if total <= cap {
+        indices.sort_unstable_by(|&i, &j| keys[i].cmp(&keys[j]));
+        indices
+    } else {
+        let (top, _, _) = indices.select_nth_unstable_by(cap, |&i, &j| keys[i].cmp(&keys[j]));
+        top.sort_unstable_by(|&i, &j| keys[i].cmp(&keys[j]));
+        top.to_vec()
+    }
+}
+
 fn rank_and_cap_callers(
     mut callers: Vec<CallEdge>,
     target_defs: &[SymbolDef],
     read_window: Option<(usize, usize)>,
 ) -> (Vec<CallEdge>, usize) {
-    callers.sort_by(|a, b| {
-        let key_a = caller_sort_key(a, target_defs, read_window);
-        let key_b = caller_sort_key(b, target_defs, read_window);
-        key_a.cmp(&key_b)
-    });
+    let total = callers.len();
+    let keys: Vec<_> = callers
+        .iter()
+        .map(|edge| caller_sort_key(edge, target_defs, read_window))
+        .collect();
+    let top_indices = select_top_indices(&keys, 32);
+    drop(keys);
 
-    let omitted = if callers.len() > 32 {
-        let count = callers.len() - 32;
-        callers.truncate(32);
-        count
-    } else {
-        0
-    };
-    (callers, omitted)
+    let mut ranked = Vec::with_capacity(top_indices.len());
+    for i in top_indices {
+        ranked.push(std::mem::take(&mut callers[i]));
+    }
+    let omitted = total.saturating_sub(32);
+    (ranked, omitted)
 }
 
 fn caller_sort_key<'a>(
@@ -493,12 +520,9 @@ fn caller_sort_key<'a>(
     target_defs: &[SymbolDef],
     read_window: Option<(usize, usize)>,
 ) -> (usize, usize, &'a str, usize, &'a str, &'a str) {
-    let def_match = target_defs.iter().find(|d| {
-        d.name == edge.callee
-            || d.qualified_name == edge.callee
-            || edge.callee.ends_with(&format!("::{}", d.name))
-            || edge.callee.ends_with(&format!(".{}", d.name))
-    });
+    let def_match = target_defs
+        .iter()
+        .find(|d| symbol_matches_def(&edge.callee, d));
 
     let (hop_depth, anchor) = match def_match {
         Some(d) => (
@@ -542,47 +566,38 @@ fn rank_and_cap_callees(
     target_defs: &[SymbolDef],
     read_window: Option<(usize, usize)>,
 ) -> (Vec<CallEdge>, usize) {
-    let hop1_seeds: std::collections::HashMap<String, usize> = callees
+    let total = callees.len();
+    let mut hop1_seeds = rustc_hash::FxHashMap::default();
+    for e in &callees {
+        if target_defs.iter().any(|d| symbol_matches_def(&e.caller, d)) {
+            hop1_seeds.insert(e.callee.as_str(), e.call_line);
+        }
+    }
+
+    let keys: Vec<_> = callees
         .iter()
-        .filter(|e| {
-            target_defs.iter().any(|d| {
-                d.name == e.caller
-                    || d.qualified_name == e.caller
-                    || e.caller.ends_with(&format!("::{}", d.name))
-                    || e.caller.ends_with(&format!(".{}", d.name))
-            })
-        })
-        .map(|e| (e.callee.clone(), e.call_line))
+        .map(|edge| callee_sort_key(edge, target_defs, &hop1_seeds, read_window))
         .collect();
+    let top_indices = select_top_indices(&keys, 32);
+    drop(keys);
 
-    callees.sort_by(|a, b| {
-        let key_a = callee_sort_key(a, target_defs, &hop1_seeds, read_window);
-        let key_b = callee_sort_key(b, target_defs, &hop1_seeds, read_window);
-        key_a.cmp(&key_b)
-    });
-
-    let omitted = if callees.len() > 32 {
-        let count = callees.len() - 32;
-        callees.truncate(32);
-        count
-    } else {
-        0
-    };
-    (callees, omitted)
+    let mut ranked = Vec::with_capacity(top_indices.len());
+    for i in top_indices {
+        ranked.push(std::mem::take(&mut callees[i]));
+    }
+    let omitted = total.saturating_sub(32);
+    (ranked, omitted)
 }
 
 fn callee_sort_key<'a>(
     edge: &'a CallEdge,
     target_defs: &[SymbolDef],
-    hop1_seeds: &std::collections::HashMap<String, usize>,
+    hop1_seeds: &rustc_hash::FxHashMap<&str, usize>,
     read_window: Option<(usize, usize)>,
 ) -> (usize, usize, &'a str, usize, &'a str, &'a str) {
-    let is_hop1 = target_defs.iter().any(|d| {
-        d.name == edge.caller
-            || d.qualified_name == edge.caller
-            || edge.caller.ends_with(&format!("::{}", d.name))
-            || edge.caller.ends_with(&format!(".{}", d.name))
-    });
+    let is_hop1 = target_defs
+        .iter()
+        .any(|d| symbol_matches_def(&edge.caller, d));
 
     let (hop_depth, anchor_line) = if is_hop1 {
         (1, edge.call_line)
