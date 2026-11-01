@@ -48,6 +48,8 @@ pub struct WorkspaceEntry {
     pub micro_reads: AtomicU64,
     /// Total micro reads with omitted advisory output.
     pub omitted_micro_reads: AtomicU64,
+    /// Total repeat reads omitted within the same session.
+    pub omitted_repeat_reads: AtomicU64,
     /// Total full-file reads with omitted self-skeletons.
     pub omitted_full_read_skeletons: AtomicU64,
     /// Total advisories trimmed to wire character budget.
@@ -83,6 +85,7 @@ impl WorkspaceEntry {
             macro_reads: AtomicU64::new(0),
             micro_reads: AtomicU64::new(0),
             omitted_micro_reads: AtomicU64::new(0),
+            omitted_repeat_reads: AtomicU64::new(0),
             omitted_full_read_skeletons: AtomicU64::new(0),
             trimmed_advisories: AtomicU64::new(0),
             last_accessed: std::sync::Mutex::new(std::time::Instant::now()),
@@ -190,6 +193,11 @@ impl WorkspaceEntry {
         self.omitted_micro_reads.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increments the count of omitted repeat reads within the same session.
+    pub fn record_omitted_repeat_read(&self) {
+        self.omitted_repeat_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Increments the count of omitted full-read skeletons.
     pub fn record_omitted_full_read_skeleton(&self) {
         self.omitted_full_read_skeletons
@@ -204,6 +212,11 @@ impl WorkspaceEntry {
     /// Returns the total omitted micro-read count for this workspace.
     pub fn omitted_micro_reads(&self) -> u64 {
         self.omitted_micro_reads.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total omitted repeat reads count for this workspace.
+    pub fn omitted_repeat_reads(&self) -> u64 {
+        self.omitted_repeat_reads.load(Ordering::Relaxed)
     }
 
     /// Returns the total omitted full-read skeletons count for this workspace.

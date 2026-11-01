@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -159,16 +160,29 @@ def compute_line_offsets(path: str) -> List[int]:
     return offsets
 
 
-def discover_source_files(target_paths: List[str]) -> Tuple[List[str], Dict[str, int], List[List[str]]]:
+def generate_session_id(project_path: str, prefix: str = "stress") -> str:
+    """
+    Generates a randomized agent conversation session identifier attributed to the
+    project or workspace directory name.
+    """
+    proj_name = os.path.basename(project_path.rstrip(os.sep)) or "root"
+    token = uuid.uuid4().hex[:12]
+    return f"{prefix}-{proj_name}-{token}"
+
+
+def discover_source_files(
+    target_paths: List[str],
+) -> Tuple[List[str], Dict[str, int], List[List[str]], List[str]]:
     """
     Discovers Rust, TypeScript, and Go source files across target directories or files.
     Skips build artifacts and hidden environment folders.
-    Returns (all_files_sorted, breakdown_dict, target_groups_list).
+    Returns (all_files_sorted, breakdown_dict, target_groups_list, target_roots_list).
     """
     extensions = {".rs", ".ts", ".tsx", ".js", ".jsx", ".go"}
     files: List[str] = []
     breakdown: Dict[str, int] = {}
     target_groups: List[List[str]] = []
+    target_roots: List[str] = []
     ignored_dirs = {
         ".git", "target", "node_modules", "dist", "build",
         ".claude", ".cursor", ".gemini", "venv", ".venv",
@@ -183,6 +197,7 @@ def discover_source_files(target_paths: List[str]) -> Tuple[List[str], Dict[str,
                 files.append(abs_target)
                 breakdown[abs_target] = 1
                 target_groups.append([abs_target])
+                target_roots.append(abs_target)
             continue
 
         if not os.path.isdir(abs_target):
@@ -199,9 +214,10 @@ def discover_source_files(target_paths: List[str]) -> Tuple[List[str], Dict[str,
         breakdown[abs_target] = len(repo_files)
         if repo_files:
             target_groups.append(sorted(list(set(repo_files))))
+            target_roots.append(abs_target)
         files.extend(repo_files)
 
-    return sorted(list(set(files))), breakdown, target_groups
+    return sorted(list(set(files))), breakdown, target_groups, target_roots
 
 
 # ==============================================================================
@@ -275,6 +291,7 @@ def build_post_read_hook(
     req_count: int,
     vendor: Optional[str] = None,
     warmup_rounds: int = 0,
+    session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Constructs a DaemonRequest::PostReadHook payload."""
     abs_path = os.path.abspath(target_file)
@@ -289,6 +306,8 @@ def build_post_read_hook(
         hook_body: Dict[str, Any] = {"file": abs_path}
         if v:
             hook_body["vendor"] = v
+        if session_id:
+            hook_body["session_id"] = session_id
         return {"PostReadHook": hook_body}
 
     start_line = rng.randint(1, total_lines)
@@ -315,6 +334,8 @@ def build_post_read_hook(
     }
     if v:
         hook_body["vendor"] = v
+    if session_id:
+        hook_body["session_id"] = session_id
 
     return {"PostReadHook": hook_body}
 
@@ -356,6 +377,8 @@ def worker_loop(
     seed: int,
     worker_id: int = 0,
     target_groups: Optional[List[List[str]]] = None,
+    group_sessions: Optional[List[str]] = None,
+    file_sessions: Optional[Dict[str, str]] = None,
 ) -> None:
     rng = random.Random(seed)
     start_time = time.monotonic()
@@ -388,14 +411,21 @@ def worker_loop(
         if max_requests > 0 and req_count >= max_requests:
             break
 
+        session_id: Optional[str] = None
         if num_groups > 1:
-            group = target_groups[(worker_id + req_count) % num_groups]
+            group_idx = (worker_id + req_count) % num_groups
+            group = target_groups[group_idx]
             target_file = group[rng.randint(0, len(group) - 1)] if group else ""
+            if group_sessions and group_idx < len(group_sessions):
+                session_id = group_sessions[group_idx]
         elif num_files > 0:
             target_file = files[file_idx % num_files]
             file_idx += 1
         else:
             target_file = ""
+
+        if not session_id and file_sessions and target_file:
+            session_id = file_sessions.get(target_file)
 
         offsets = file_offsets.get(target_file, [0])
 
@@ -416,6 +446,7 @@ def worker_loop(
                 target_file, offsets, rng, req_count,
                 vendor=vendor,
                 warmup_rounds=num_groups,
+                session_id=session_id,
             )
         elif mode == "ping":
             category = "ping"
@@ -442,6 +473,7 @@ def worker_loop(
                     target_file, offsets, rng, req_count,
                     vendor=vendor,
                     warmup_rounds=num_groups,
+                    session_id=session_id,
                 )
             elif roll < 0.95:
                 category = "ping"
@@ -651,6 +683,12 @@ def main() -> None:
         help="Simulate specific agent vendor read cap behavior (default: claude)",
     )
     parser.add_argument(
+        "--session-id",
+        type=str,
+        default=None,
+        help="Explicit agent session ID override (default: randomized per target project)",
+    )
+    parser.add_argument(
         "--target-dirs",
         "--target-dir",
         "--files",
@@ -704,9 +742,27 @@ def main() -> None:
     initial_status = query_daemon_status(sock_path)
 
     # Source files discovery
-    files, breakdown, target_groups = discover_source_files(args.target_dirs)
+    files, breakdown, target_groups, target_roots = discover_source_files(args.target_dirs)
     if not files and args.mode in ("distill", "hook", "mixed"):
         print(f"Warning: No matching source files (.rs, .ts, .tsx, .js, .jsx, .go) found in {args.target_dirs}.", file=sys.stderr)
+
+    # Assign a randomized session ID for each project target (or explicit override if provided)
+    project_sessions: Dict[str, str] = {}
+    group_sessions: List[str] = []
+    file_sessions: Dict[str, str] = {}
+
+    for root, grp in zip(target_roots, target_groups):
+        sid = args.session_id if args.session_id else generate_session_id(root)
+        project_sessions[root] = sid
+        group_sessions.append(sid)
+        for f in grp:
+            file_sessions[f] = sid
+
+    # Fallback for any stray files
+    default_session_id = args.session_id or f"stress-session-{uuid.uuid4().hex[:12]}"
+    for f in files:
+        if f not in file_sessions:
+            file_sessions[f] = default_session_id
 
     # Shuffle files to interleave operations across packages and subtrees
     random.seed(42)
@@ -730,7 +786,8 @@ def main() -> None:
         else:
             print(f"Target Roots:    {len(args.target_dirs)} path(s)")
         for repo, count in list(breakdown.items())[:5]:
-            print(f"  - {repo}: {count} files")
+            sid = project_sessions.get(repo, "n/a")
+            print(f"  - {repo}: {count} files (session: '{sid}')")
         if len(breakdown) > 5:
             print(f"  ... and {len(breakdown) - 5} more directories")
         print(f"Total Discovered:{len(files)} files")
@@ -762,6 +819,8 @@ def main() -> None:
                 42 + i,
                 i,
                 target_groups,
+                group_sessions,
+                file_sessions,
             ),
         )
         threads.append(t)
@@ -835,12 +894,20 @@ def main() -> None:
                     "count": len(lats),
                     "latencies_ms": {k: round(v, 2) for k, v in compute_percentiles(lats).items()},
                 }
+        result_payload["projects"] = {
+            repo: {
+                "files": count,
+                "session_id": project_sessions.get(repo, ""),
+            }
+            for repo, count in breakdown.items()
+        }
         if initial_status and final_status:
             result_payload["daemon_telemetry"] = {
                 "initial_rss_mb": initial_status.get("memory_rss_mb", 0),
                 "final_rss_mb": final_status.get("memory_rss_mb", 0),
                 "rss_delta_mb": round(final_status.get("memory_rss_mb", 0) - initial_status.get("memory_rss_mb", 0), 2),
                 "hooks_served_delta": final_status.get("hooks_served", 0) - initial_status.get("hooks_served", 0),
+                "omitted_repeat_reads_delta": final_status.get("omitted_repeat_reads", 0) - initial_status.get("omitted_repeat_reads", 0),
             }
         print(json.dumps(result_payload, indent=2))
         return
@@ -885,10 +952,13 @@ def main() -> None:
         final_rss = final_status.get("memory_rss_mb", 0.0)
         rss_delta = final_rss - init_rss
         hooks_delta = final_status.get("hooks_served", 0) - initial_status.get("hooks_served", 0)
+        repeats_delta = final_status.get("omitted_repeat_reads", 0) - initial_status.get("omitted_repeat_reads", 0)
 
         print("\n--- Daemon Telemetry ---")
         print(f"Process Resident Memory: {init_rss:.1f} MB -> {final_rss:.1f} MB (delta: {rss_delta:+.2f} MB)")
         print(f"Hooks / Queries Served:  +{hooks_delta:,} requests in session")
+        if repeats_delta > 0 or "omitted_repeat_reads" in final_status:
+            print(f"Repeats Deduplicated:    +{repeats_delta:,} redundant macro reads suppressed")
 
     if all_errors:
         print("\n--- Error Summary (Sample) ---")

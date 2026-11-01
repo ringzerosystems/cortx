@@ -52,6 +52,7 @@ When pairing with [scripts/profile-daemon.sh](../../../scripts/profile-daemon.sh
 | `--threads <N>` | `8` | Number of concurrent worker threads |
 | `--mode <MODE>` | `hook` | Request type: `hook` (advisory read hooks), `distill` (raw skeletons), `mixed`, `ping`, `status` |
 | `--vendor <NAME>` | `claude` | Agent read-cap profile: `claude`, `agy`, `opencode`, `generic`, `random` |
+| `--session-id <ID>` | `randomized` | Conversation session ID override (random per project if omitted) |
 | `--config <PATH>` | `~/.config/cortx/cortx.toml` | Custom config override path |
 | `--dry-run` | `false` | Resolves config folders and prints command without running |
 

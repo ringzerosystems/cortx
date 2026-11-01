@@ -239,6 +239,7 @@ async fn claude_micro_read_records_exact_distill_bytes() {
             total_lines: Some(TOTAL_LINES),
             vendor: Some(AgentVendor::Claude),
             is_full_read: Some(false),
+            session_id: None,
         },
     )
     .await
@@ -316,6 +317,7 @@ async fn claude_omitted_bounds_apply_eof_and_token_cap() {
             total_lines: Some(TOTAL_LINES),
             vendor: Some(AgentVendor::Claude),
             is_full_read: Some(false),
+            session_id: None,
         },
     )
     .await
@@ -391,6 +393,7 @@ async fn agy_micro_read_records_exact_distill_bytes() {
             total_lines: Some(TOTAL_LINES),
             vendor: Some(AgentVendor::Agy),
             is_full_read: Some(false),
+            session_id: None,
         },
     )
     .await
@@ -463,6 +466,7 @@ async fn agy_omitted_lines_apply_default_800_lines_and_46kb_cap() {
             total_lines: Some(TOTAL_LINES),
             vendor: Some(AgentVendor::Agy),
             is_full_read: Some(false),
+            session_id: None,
         },
     )
     .await
@@ -576,6 +580,7 @@ async fn three_tier_coverage_micro_drops_advisory() {
             total_lines: Some(1000),
             vendor: Some(AgentVendor::Generic),
             is_full_read: Some(false),
+            session_id: None,
         },
     )
     .await
@@ -622,6 +627,7 @@ async fn three_tier_coverage_full_file_delivers_cross_file_callers_without_skele
             total_lines: Some(3),
             vendor: Some(AgentVendor::Generic),
             is_full_read: Some(true),
+            session_id: None,
         },
     )
     .await
@@ -694,6 +700,7 @@ async fn three_tier_coverage_partial_macro_delivers_ranked_callers_and_unread_ou
             total_lines: Some(240),
             vendor: Some(AgentVendor::Generic),
             is_full_read: Some(false),
+            session_id: None,
         },
     )
     .await
@@ -807,6 +814,7 @@ async fn opencode_stdin_micro_read_omits_advisory_and_preserves_mtime() {
             total_lines: Some(TOTAL_LINES),
             vendor: Some(AgentVendor::OpenCode),
             is_full_read: Some(false),
+            session_id: None,
         },
     )
     .await
@@ -876,6 +884,7 @@ async fn opencode_stdin_full_file_under_2000_lines_delivers_callers_without_skel
             total_lines: Some(3),
             vendor: Some(AgentVendor::OpenCode),
             is_full_read: Some(true),
+            session_id: None,
         },
     )
     .await
@@ -962,6 +971,7 @@ async fn opencode_stdin_partial_macro_over_2000_lines_delivers_outline_and_prese
             total_lines: Some(TOTAL_LINES),
             vendor: Some(AgentVendor::OpenCode),
             is_full_read: Some(false),
+            session_id: None,
         },
     )
     .await

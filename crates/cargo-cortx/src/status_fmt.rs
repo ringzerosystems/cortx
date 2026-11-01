@@ -161,21 +161,23 @@ pub(crate) fn format_daemon_version_protocol(version: &str, protocol: u32) -> St
         version.strip_prefix('v').unwrap_or(version)
     };
     format!(
-        "Daemon Version / Protocol: v{} (protocol v{})",
-        ver, protocol
+        "{:<22}v{} (protocol v{})",
+        "Version / Protocol:", ver, protocol
     )
 }
 
 pub(crate) fn format_section_dispositions(
     omitted_micro: u64,
+    omitted_repeat: u64,
     omitted_skeletons: u64,
     trimmed: u64,
     fallbacks: u64,
 ) -> String {
     format!(
-        "{:<22}{} micro omitted, {} full skeletons omitted, {} trimmed, {} parse fallbacks",
+        "{:<22}{} micro omitted, {} repeats omitted, {} full skeletons omitted, {} trimmed, {} parse fallbacks",
         "Section Dispositions:",
         format_with_commas(omitted_micro as usize),
+        format_with_commas(omitted_repeat as usize),
         format_with_commas(omitted_skeletons as usize),
         format_with_commas(trimmed as usize),
         format_with_commas(fallbacks as usize)
@@ -335,6 +337,7 @@ fn print_context_telemetry(status: &DaemonStatusInfo) {
             "{}",
             format_section_dispositions(
                 status.omitted_micro_reads,
+                status.omitted_repeat_reads,
                 status.omitted_full_read_skeletons,
                 status.trimmed_advisories,
                 status.parse_fallbacks
@@ -484,6 +487,7 @@ mod tests {
             macro_reads: 0,
             micro_reads: 0,
             omitted_micro_reads: 0,
+            omitted_repeat_reads: 0,
             omitted_full_read_skeletons: 0,
             trimmed_advisories: 0,
             parse_fallbacks: 0,
@@ -506,27 +510,27 @@ mod tests {
     fn test_format_daemon_version_protocol() {
         assert_eq!(
             format_daemon_version_protocol("0.1.0", 2),
-            "Daemon Version / Protocol: v0.1.0 (protocol v2)"
+            "Version / Protocol:   v0.1.0 (protocol v2)"
         );
         assert_eq!(
             format_daemon_version_protocol("v0.2.1", 3),
-            "Daemon Version / Protocol: v0.2.1 (protocol v3)"
+            "Version / Protocol:   v0.2.1 (protocol v3)"
         );
         assert_eq!(
             format_daemon_version_protocol("", 2),
-            "Daemon Version / Protocol: v0.1.0 (protocol v2)"
+            "Version / Protocol:   v0.1.0 (protocol v2)"
         );
     }
 
     #[test]
     fn test_format_section_dispositions() {
         assert_eq!(
-            format_section_dispositions(0, 0, 0, 0),
-            "Section Dispositions: 0 micro omitted, 0 full skeletons omitted, 0 trimmed, 0 parse fallbacks"
+            format_section_dispositions(0, 0, 0, 0, 0),
+            "Section Dispositions: 0 micro omitted, 0 repeats omitted, 0 full skeletons omitted, 0 trimmed, 0 parse fallbacks"
         );
         assert_eq!(
-            format_section_dispositions(12, 3, 4, 1),
-            "Section Dispositions: 12 micro omitted, 3 full skeletons omitted, 4 trimmed, 1 parse fallbacks"
+            format_section_dispositions(12, 5, 3, 4, 1),
+            "Section Dispositions: 12 micro omitted, 5 repeats omitted, 3 full skeletons omitted, 4 trimmed, 1 parse fallbacks"
         );
     }
 }

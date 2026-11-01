@@ -187,6 +187,7 @@ impl WorktreeAuthContract for WorktreeAuth {
             total_lines: None,
             vendor: None,
             is_full_read: None,
+            session_id: None,
         },
     )
     .await
@@ -229,6 +230,7 @@ impl WorktreeAuthContract for WorktreeAuth {
             total_lines: None,
             vendor: None,
             is_full_read: None,
+            session_id: None,
         },
     )
     .await
@@ -400,6 +402,7 @@ ignored_dirs = [".claude"]
             total_lines: None,
             vendor: None,
             is_full_read: None,
+            session_id: None,
         },
     )
     .await
@@ -416,6 +419,7 @@ ignored_dirs = [".claude"]
             total_lines: None,
             vendor: None,
             is_full_read: None,
+            session_id: None,
         },
     )
     .await
@@ -672,6 +676,7 @@ pub fn wt_modified_caller(engine: &ServiceEngine) -> bool {
             total_lines: None,
             vendor: None,
             is_full_read: None,
+            session_id: None,
         },
     )
     .await
@@ -717,6 +722,7 @@ pub fn wt_modified_caller(engine: &ServiceEngine) -> bool {
             total_lines: None,
             vendor: None,
             is_full_read: None,
+            session_id: None,
         },
     )
     .await

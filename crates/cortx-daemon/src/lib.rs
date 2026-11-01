@@ -13,6 +13,7 @@ pub mod logging;
 pub mod protocol;
 pub mod registry;
 pub mod server;
+pub mod session;
 pub mod watcher;
 
 pub use error::DaemonError;
@@ -245,6 +246,7 @@ mod tests {
                 total_lines: Some(200),
                 vendor: None,
                 is_full_read: None,
+                session_id: None,
             },
         )
         .await
@@ -278,6 +280,7 @@ mod tests {
                 total_lines: Some(200),
                 vendor: None,
                 is_full_read: None,
+                session_id: None,
             },
         )
         .await
@@ -330,6 +333,7 @@ mod tests {
                         total_lines: Some(200),
                         vendor: None,
                         is_full_read: None,
+                        session_id: None,
                     },
                 )
                 .await

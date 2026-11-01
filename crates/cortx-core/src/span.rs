@@ -369,6 +369,9 @@ pub struct ParsedHookInput {
     /// Whether the tool execution resulted in an error (e.g. Antigravity PostToolUse error).
     #[serde(default)]
     pub tool_error: bool,
+    /// Conversation or session identifier extracted from the hook payload.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Parses a JSON hook payload from Claude Code or Antigravity (AGY) `stdin`.
@@ -425,10 +428,14 @@ fn parse_agy_tool_call(
         .or(Some(AgentVendor::Agy));
 
     let tool_error = has_error(root) || has_error(tool_call) || has_error(args);
+    let session_id = extract_session_id(root)
+        .or_else(|| extract_session_id(tool_call))
+        .or_else(|| extract_session_id(args));
     Some(ParsedHookInput {
         file_path,
         span,
         tool_error,
+        session_id,
     })
 }
 
@@ -468,10 +475,12 @@ fn parse_tool_input_envelope(
         }));
 
     let tool_error = has_error(root) || has_error(tool_input);
+    let session_id = extract_session_id(root).or_else(|| extract_session_id(tool_input));
     Some(ParsedHookInput {
         file_path,
         span,
         tool_error,
+        session_id,
     })
 }
 
@@ -523,11 +532,34 @@ fn parse_flat_object(obj: &serde_json::Map<String, Value>) -> Option<ParsedHookI
         return None;
     }
 
+    let session_id = extract_session_id(obj);
     Some(ParsedHookInput {
         file_path,
         span,
         tool_error,
+        session_id,
     })
+}
+
+fn extract_session_id(map: &serde_json::Map<String, Value>) -> Option<String> {
+    const KEYS: &[&str] = &[
+        "conversationId",
+        "conversation_id",
+        "sessionId",
+        "session_id",
+        "session",
+        "chatId",
+        "chat_id",
+    ];
+    for key in KEYS {
+        if let Some(v) = map.get(*key).and_then(Value::as_str) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn extract_path(map: &serde_json::Map<String, Value>) -> Option<PathBuf> {
@@ -602,12 +634,14 @@ fn extract_span_fields(map: &serde_json::Map<String, Value>) -> ReadSpan {
 }
 
 /// Caller-resolved environment inputs for read-budget calculation.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadBudgetEnv {
     /// Vendor detected from the process environment (lowest-precedence signal).
     pub env_vendor: Option<AgentVendor>,
     /// `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS` override, if set and > 0.
     pub claude_max_read_tokens: Option<u64>,
+    /// Conversation or session identifier detected from process environment.
+    pub env_session_id: Option<String>,
 }
 
 impl ReadBudgetEnv {
@@ -659,9 +693,18 @@ pub fn detect_budget_env(get: impl Fn(&str) -> Option<String>) -> ReadBudgetEnv 
         .and_then(|val| val.trim().parse::<u64>().ok())
         .filter(|&tokens| tokens > 0);
 
+    let env_session_id = get("ANTIGRAVITY_CONVERSATION_ID")
+        .or_else(|| get("CLAUDE_SESSION_ID"))
+        .or_else(|| get("CLAUDE_CODE_SESSION_ID"))
+        .or_else(|| get("CLAUDE_CONVERSATION_ID"))
+        .or_else(|| get("OPENCODE_SESSION_ID"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     ReadBudgetEnv {
         env_vendor,
         claude_max_read_tokens,
+        env_session_id,
     }
 }
 
@@ -1106,6 +1149,7 @@ mod tests {
         let env_10k = ReadBudgetEnv {
             env_vendor: None,
             claude_max_read_tokens: Some(10_000),
+            ..Default::default()
         };
         assert_eq!(
             resolve_read_budget(&claude_unbounded, &medium_150k, &env_10k),
@@ -1137,6 +1181,7 @@ mod tests {
         let env_claude = ReadBudgetEnv {
             env_vendor: Some(AgentVendor::Claude),
             claude_max_read_tokens: None,
+            ..Default::default()
         };
         let span_explicit_generic = ReadSpan {
             vendor: Some(AgentVendor::Generic),
@@ -1540,5 +1585,73 @@ mod tests {
         assert_eq!(json, "\"full_file\"");
         let de: ReadCoverage = serde_json::from_str(&json).unwrap();
         assert_eq!(de, ReadCoverage::FullFile);
+    }
+
+    #[test]
+    fn test_session_id_extraction_across_vendors() {
+        // AGY conversationId in root
+        let agy_json = r#"{
+            "conversationId": "conv-agy-9876",
+            "toolCall": {
+                "name": "read_file",
+                "args": { "Path": "/tmp/test.rs", "StartLine": 1, "EndLine": 500 }
+            }
+        }"#;
+        let parsed_agy = parse_hook_stdin(agy_json).expect("parse agy");
+        assert_eq!(parsed_agy.session_id, Some("conv-agy-9876".to_string()));
+
+        // Claude session_id in root envelope
+        let claude_json = r#"{
+            "session_id": "sess-claude-1234",
+            "tool_name": "Read",
+            "tool_input": { "file_path": "/tmp/test.rs", "offset": 1, "limit": 500 }
+        }"#;
+        let parsed_claude = parse_hook_stdin(claude_json).expect("parse claude");
+        assert_eq!(
+            parsed_claude.session_id,
+            Some("sess-claude-1234".to_string())
+        );
+
+        // OpenCode sessionId in envelope
+        let opencode_json = r#"{
+            "sessionId": "opencode-sess-abc",
+            "tool_name": "read",
+            "tool_input": { "filePath": "/tmp/test.rs" }
+        }"#;
+        let parsed_opencode = parse_hook_stdin(opencode_json).expect("parse opencode");
+        assert_eq!(
+            parsed_opencode.session_id,
+            Some("opencode-sess-abc".to_string())
+        );
+
+        // Flat JSON with conversation_id
+        let flat_json = r#"{
+            "file_path": "/tmp/test.rs",
+            "conversation_id": "flat-conv-xyz"
+        }"#;
+        let parsed_flat = parse_hook_stdin(flat_json).expect("parse flat");
+        assert_eq!(parsed_flat.session_id, Some("flat-conv-xyz".to_string()));
+
+        // Environment variable detection
+        let env_agy = detect_budget_env(|k| {
+            if k == "ANTIGRAVITY_CONVERSATION_ID" {
+                Some("env-agy-conv".to_string())
+            } else {
+                None
+            }
+        });
+        assert_eq!(env_agy.env_session_id, Some("env-agy-conv".to_string()));
+
+        let env_claude = detect_budget_env(|k| {
+            if k == "CLAUDE_CODE_SESSION_ID" {
+                Some("env-claude-sess".to_string())
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            env_claude.env_session_id,
+            Some("env-claude-sess".to_string())
+        );
     }
 }

@@ -86,6 +86,12 @@ def main() -> None:
         help="Simulate specific agent vendor read cap behavior (default: claude)",
     )
     parser.add_argument(
+        "--session-id",
+        type=str,
+        default=None,
+        help="Explicit agent session ID override (default: randomized per target project)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the resolved command and folders without executing",
@@ -130,6 +136,9 @@ def main() -> None:
         "--target-dirs",
         *folders,
     ]
+
+    if args.session_id:
+        cmd.extend(["--session-id", args.session_id])
 
     if args.extra_args:
         # Strip any leading '--' if passed by argparse REMAINDER
