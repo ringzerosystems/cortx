@@ -655,9 +655,7 @@ impl SymbolIndex {
                             if let Some((pkg, _func)) = target_path.rsplit_once('.') {
                                 if !idx.manifests.go_module_prefixes.is_empty() {
                                     if idx.manifests.is_workspace_go_module(pkg) {
-                                        idx.record_call_edge_with_line(
-                                            &caller, callee, file, line,
-                                        );
+                                        idx.record_call_edge_with_line(&caller, callee, file, line);
                                     }
                                 } else {
                                     idx.record_call_edge_with_line(&caller, callee, file, line);
