@@ -5,7 +5,7 @@ use parking_lot::RwLock;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -44,18 +44,18 @@ pub struct SymbolIndex {
     pub callers_map: FxHashMap<SymbolId, Vec<CompactCallEdge>>,
     #[serde(default)]
     pub callees_map: FxHashMap<SymbolId, Vec<CompactCallEdge>>,
-    pub contracts_map: HashMap<String, Vec<ContractInfo>>,
-    pub symbols_map: HashMap<String, Vec<SymbolDef>>,
+    pub contracts_map: FxHashMap<String, Vec<ContractInfo>>,
+    pub symbols_map: FxHashMap<String, Vec<SymbolDef>>,
     #[serde(default)]
-    pub file_to_symbols: HashMap<String, Vec<String>>,
+    pub file_to_symbols: FxHashMap<String, Vec<String>>,
     #[serde(default)]
-    pub file_symbols: HashMap<PathBuf, Vec<SymbolDef>>,
+    pub file_symbols: FxHashMap<PathBuf, Vec<SymbolDef>>,
     #[serde(default)]
     pub routes: Vec<RouteBinding>,
     #[serde(skip)]
-    pub file_name_to_paths: HashMap<String, Vec<String>>,
+    pub file_name_to_paths: FxHashMap<String, Vec<String>>,
     #[serde(skip)]
-    pub file_facts: HashMap<PathBuf, std::sync::Arc<FileFacts>>,
+    pub file_facts: FxHashMap<PathBuf, std::sync::Arc<FileFacts>>,
     #[serde(skip, default)]
     pub manifests: std::sync::Arc<WorkspaceManifests>,
     #[serde(skip)]
@@ -70,13 +70,13 @@ impl Default for SymbolIndex {
             pool: StringPool::default(),
             callers_map: FxHashMap::default(),
             callees_map: FxHashMap::default(),
-            contracts_map: HashMap::default(),
-            symbols_map: HashMap::default(),
-            file_to_symbols: HashMap::default(),
-            file_symbols: HashMap::default(),
+            contracts_map: FxHashMap::default(),
+            symbols_map: FxHashMap::default(),
+            file_to_symbols: FxHashMap::default(),
+            file_symbols: FxHashMap::default(),
             routes: Vec::default(),
-            file_name_to_paths: HashMap::default(),
-            file_facts: HashMap::default(),
+            file_name_to_paths: FxHashMap::default(),
+            file_facts: FxHashMap::default(),
             manifests: std::sync::Arc::new(WorkspaceManifests::discover(Path::new("."), &[])),
             parse_fallbacks: 0,
             skeleton_cache: Arc::new(RwLock::new(FxHashMap::default())),
@@ -461,10 +461,8 @@ impl SymbolIndex {
             })
             .collect();
 
-        let mut file_facts = HashMap::with_capacity(facts_vec.len());
-        for (p, f) in facts_vec {
-            file_facts.insert(p, f);
-        }
+        let file_facts: FxHashMap<PathBuf, std::sync::Arc<FileFacts>> =
+            facts_vec.into_iter().collect();
         let parse_ms = parse_start.elapsed().as_millis();
 
         let link_start = std::time::Instant::now();
@@ -544,7 +542,7 @@ impl SymbolIndex {
     }
 
     pub fn link_facts(
-        file_facts: &HashMap<PathBuf, std::sync::Arc<FileFacts>>,
+        file_facts: &FxHashMap<PathBuf, std::sync::Arc<FileFacts>>,
         manifests: std::sync::Arc<WorkspaceManifests>,
         parse_fallbacks: usize,
     ) -> SymbolIndex {
@@ -576,6 +574,8 @@ impl SymbolIndex {
                 .extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e == "ts" || e == "tsx" || e == "js" || e == "jsx");
+            let file_str = facts.file_path.to_string_lossy();
+            let file = file_str.as_ref();
 
             for call in &facts.calls {
                 let caller = if is_rs {
@@ -612,7 +612,6 @@ impl SymbolIndex {
                     call.caller_fqn.clone()
                 };
                 let line = call.call_line;
-                let file = facts.file_path.to_string_lossy().to_string();
 
                 match &call.target {
                     RawCalleeTarget::Path(target_path) => {
@@ -637,19 +636,19 @@ impl SymbolIndex {
                                     idx.record_call_edge_with_line(
                                         &caller,
                                         callee_name,
-                                        &file,
+                                        file,
                                         line,
                                     );
                                 } else {
                                     idx.record_call_edge_with_line(
                                         &caller,
                                         imported_name,
-                                        &file,
+                                        file,
                                         line,
                                     );
                                 }
                             } else {
-                                idx.record_call_edge_with_line(&caller, imported_name, &file, line);
+                                idx.record_call_edge_with_line(&caller, imported_name, file, line);
                             }
                         } else if is_go {
                             let callee = target_path.rsplit('.').next().unwrap_or(target_path);
@@ -657,31 +656,31 @@ impl SymbolIndex {
                                 if !idx.manifests.go_module_prefixes.is_empty() {
                                     if idx.manifests.is_workspace_go_module(pkg) {
                                         idx.record_call_edge_with_line(
-                                            &caller, callee, &file, line,
+                                            &caller, callee, file, line,
                                         );
                                     }
                                 } else {
-                                    idx.record_call_edge_with_line(&caller, callee, &file, line);
+                                    idx.record_call_edge_with_line(&caller, callee, file, line);
                                 }
                             } else {
-                                idx.record_call_edge_with_line(&caller, callee, &file, line);
+                                idx.record_call_edge_with_line(&caller, callee, file, line);
                             }
                         } else if target_path.starts_with("crate::") {
                             let callee = target_path.rsplit("::").next().unwrap_or(target_path);
-                            idx.record_call_edge_with_line(&caller, callee, &file, line);
+                            idx.record_call_edge_with_line(&caller, callee, file, line);
                         } else if let Some(resolved_fqn) =
                             idx.symbols_map.get(target_path).and_then(|syms| {
                                 syms.iter()
-                                    .find(|s| s.file == facts.file_path.to_string_lossy())
+                                    .find(|s| s.file == file)
                                     .map(|s| s.qualified_name.clone())
                                     .or_else(|| syms.first().map(|s| s.qualified_name.clone()))
                             })
                         {
                             let callee = resolved_fqn.rsplit("::").next().unwrap_or(&resolved_fqn);
-                            idx.record_call_edge_with_line(&caller, callee, &file, line);
+                            idx.record_call_edge_with_line(&caller, callee, file, line);
                         } else {
                             let callee = target_path.rsplit("::").next().unwrap_or(target_path);
-                            idx.record_call_edge_with_line(&caller, callee, &file, line);
+                            idx.record_call_edge_with_line(&caller, callee, file, line);
                         }
                     }
                     RawCalleeTarget::Method {
@@ -698,15 +697,15 @@ impl SymbolIndex {
                                     idx.record_call_edge_with_line(
                                         &caller,
                                         method_name,
-                                        &file,
+                                        file,
                                         line,
                                     );
                                 }
                             } else {
-                                idx.record_call_edge_with_line(&caller, method_name, &file, line);
+                                idx.record_call_edge_with_line(&caller, method_name, file, line);
                             }
                         } else {
-                            idx.record_call_edge_with_line(&caller, method_name, &file, line);
+                            idx.record_call_edge_with_line(&caller, method_name, file, line);
                         }
                     }
                     RawCalleeTarget::FieldChain {
@@ -725,15 +724,15 @@ impl SymbolIndex {
                                     idx.record_call_edge_with_line(
                                         &caller,
                                         method_name,
-                                        &file,
+                                        file,
                                         line,
                                     );
                                 }
                             } else {
-                                idx.record_call_edge_with_line(&caller, method_name, &file, line);
+                                idx.record_call_edge_with_line(&caller, method_name, file, line);
                             }
                         } else {
-                            idx.record_call_edge_with_line(&caller, method_name, &file, line);
+                            idx.record_call_edge_with_line(&caller, method_name, file, line);
                         }
                     }
                 }
@@ -755,7 +754,7 @@ impl SymbolIndex {
     fn resolve_ts_barrel_export(
         target_file: &Path,
         name: &str,
-        file_facts: &HashMap<PathBuf, std::sync::Arc<FileFacts>>,
+        file_facts: &FxHashMap<PathBuf, std::sync::Arc<FileFacts>>,
         manifests: &WorkspaceManifests,
         depth: usize,
         visited: &mut HashSet<(PathBuf, String)>,
@@ -833,7 +832,7 @@ impl SymbolIndex {
     fn resolve_struct_field_chain(
         receiver: &TypeRef,
         fields: &[String],
-        file_facts: &HashMap<PathBuf, std::sync::Arc<FileFacts>>,
+        file_facts: &FxHashMap<PathBuf, std::sync::Arc<FileFacts>>,
     ) -> Option<TypeRef> {
         let mut curr = receiver.unwrap_container().clone();
         for field in fields.iter().take(4) {
