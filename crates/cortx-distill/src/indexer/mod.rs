@@ -349,7 +349,9 @@ impl SymbolIndex {
                     return false;
                 }
                 if e.file_type().is_dir() {
-                    if p.join(".git").exists()
+                    let is_nested_repo = !rel.components().any(|c| c.as_os_str() == "src")
+                        && p.join(".git").exists();
+                    if is_nested_repo
                         || rel == Path::new(".worktrees")
                         || rel.starts_with(".worktrees")
                     {
