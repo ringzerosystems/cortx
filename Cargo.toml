@@ -52,3 +52,4 @@ tree-sitter = "0.26"
 tree-sitter-go = "0.25"
 rayon = "1.10"
 rustc-hash = "2.1"
+mimalloc = { version = "0.1", default-features = false }
