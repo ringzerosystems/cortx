@@ -110,7 +110,13 @@ impl<'a> OverlayView<'a> {
     /// Retrieves downstream callees across overlay and base, filtering shadowed files.
     pub fn get_callees(&self, symbol: &str, depth: usize) -> Vec<CallEdge> {
         let mut results = Vec::new();
-        self.collect_edges(false, symbol, depth, &mut results, &mut FxHashSet::default());
+        self.collect_edges(
+            false,
+            symbol,
+            depth,
+            &mut results,
+            &mut FxHashSet::default(),
+        );
         results
     }
 
@@ -133,7 +139,11 @@ impl<'a> OverlayView<'a> {
             .unwrap_or_default();
         let mut seen = FxHashSet::default();
         for c in &results {
-            seen.insert((c.trait_name.as_str(), c.target_type.as_str(), c.file.as_str()));
+            seen.insert((
+                c.trait_name.as_str(),
+                c.target_type.as_str(),
+                c.file.as_str(),
+            ));
         }
 
         if let Some(base_idx) = self.base {
@@ -141,7 +151,11 @@ impl<'a> OverlayView<'a> {
             let mut keep = vec![false; base_contracts.len()];
             for (i, c) in base_contracts.iter().enumerate() {
                 if !self.is_shadowed(&c.file)
-                    && seen.insert((c.trait_name.as_str(), c.target_type.as_str(), c.file.as_str()))
+                    && seen.insert((
+                        c.trait_name.as_str(),
+                        c.target_type.as_str(),
+                        c.file.as_str(),
+                    ))
                 {
                     keep[i] = true;
                 }

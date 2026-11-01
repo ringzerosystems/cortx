@@ -317,7 +317,10 @@ pub(crate) fn is_test_path(path: &Path) -> bool {
         }
     }
     let s = path.to_str().unwrap_or("");
-    let s = s.strip_prefix("./").or_else(|| s.strip_prefix(".\\")).unwrap_or(s);
+    let s = s
+        .strip_prefix("./")
+        .or_else(|| s.strip_prefix(".\\"))
+        .unwrap_or(s);
     if s.starts_with("tests/")
         || s.starts_with("tests\\")
         || s.contains("/tests/")
@@ -380,7 +383,11 @@ fn collect_contracts_view(
     let mut seen = FxHashSet::default();
     let mut keep = vec![false; contracts.len()];
     for (i, c) in contracts.iter().enumerate() {
-        if seen.insert((c.trait_name.as_str(), c.target_type.as_str(), c.file.as_str())) {
+        if seen.insert((
+            c.trait_name.as_str(),
+            c.target_type.as_str(),
+            c.file.as_str(),
+        )) {
             keep[i] = true;
         }
     }
@@ -453,8 +460,7 @@ fn normalize_edge_files(edges: &mut [CallEdge], ws_root: Option<&Path>) {
         if let Some(root) = ws_root {
             if edge.file.starts_with('/')
                 || (cfg!(windows)
-                    && (edge.file.starts_with('\\')
-                        || edge.file.as_bytes().get(1) == Some(&b':')))
+                    && (edge.file.starts_with('\\') || edge.file.as_bytes().get(1) == Some(&b':')))
             {
                 if let Ok(rel) = Path::new(&edge.file).strip_prefix(root) {
                     edge.file = rel.to_string_lossy().to_string();
