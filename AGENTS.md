@@ -86,7 +86,7 @@ cargo cortx daemon --hook-post-read --file <PATH>                  # advisory po
 The codebase enforces strict layer boundaries and structural rules:
 
 - **Dependency Boundaries**:
-  - `crates/cortx-distill`: Restrict dependencies strictly to AST parsing (`syn`, `quote`, `tree-sitter-rust`, `oxc_parser`, `oxc_allocator`, `oxc_ast`, `oxc_span`) and symbol query layers.
+  - `crates/cortx-distill`: Restrict dependencies strictly to AST parsing (`syn`, `quote`, `tree-sitter`, `tree-sitter-rust`, `tree-sitter-go`, `oxc_parser`, `oxc_allocator`, `oxc_ast`, `oxc_span`, `oxc_resolver`, `globset`, `toml`) and symbol query layers.
   - `crates/cortx-core`: Maintain total independence as the shared foundation, containing exclusively common types, configuration models, and error primitives.
   - `crates/cargo-cortx` (CLI router) and `crates/cortx-daemon`: Assemble and coordinate the lower-tier library crates.
 - **Function and File Caps**:

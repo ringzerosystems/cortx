@@ -6,24 +6,37 @@
 
 use crate::error::DaemonError;
 use crate::logging::WorkspaceLogger;
-use cortx_distill::SymbolIndex;
+use cortx_core::canonicalize_best_effort;
+use cortx_distill::indexer::WatchBatchUpdate;
+use cortx_distill::{SymbolIndex, WorkspaceManifests};
+use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::RwLock as TokioRwLock;
 use tokio_util::sync::CancellationToken;
 
+/// Raw filesystem mutation or eviction event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawWatchEvent {
+    /// File created or modified.
+    Upsert(PathBuf),
+    /// File or directory deleted or renamed away.
+    Remove(PathBuf),
+}
+
 /// Workspace entry registered with the dynamic file watcher.
 #[derive(Clone)]
 struct WatchedWorkspace {
     index: Arc<TokioRwLock<SymbolIndex>>,
+    shadowed_files: Arc<TokioRwLock<HashSet<PathBuf>>>,
     logger: Arc<WorkspaceLogger>,
     config: cortx_core::ProjectConfig,
 }
 
 /// Shared internal state for the dynamic file watcher.
-struct DynamicWatcherInner {
+pub struct DynamicWatcherInner {
     watcher: Mutex<notify::RecommendedWatcher>,
     workspaces: RwLock<HashMap<PathBuf, WatchedWorkspace>>,
 }
@@ -38,21 +51,49 @@ pub struct DynamicWatcherManager {
 impl DynamicWatcherManager {
     /// Initializes a new dynamic watcher manager supervised by the provided cancellation token.
     pub fn new(token: CancellationToken) -> Result<Self, DaemonError> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<PathBuf>(1024);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<RawWatchEvent>(2048);
 
         let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             if let Ok(event) = res {
-                if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
-                    for path in event.paths {
-                        if path.extension().is_some_and(|ext| {
-                            matches!(
-                                ext.to_str().unwrap_or(""),
-                                "rs" | "ts" | "tsx" | "js" | "jsx" | "go"
-                            )
-                        }) {
-                            let _ = tx.blocking_send(path);
+                match event.kind {
+                    EventKind::Remove(_) => {
+                        for path in event.paths {
+                            let _ = tx.blocking_send(RawWatchEvent::Remove(path));
                         }
                     }
+                    EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+                        for path in event.paths {
+                            let _ = tx.blocking_send(RawWatchEvent::Remove(path));
+                        }
+                    }
+                    EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+                        for path in event.paths {
+                            if Self::is_path_relevant_for_upsert(&path) {
+                                let _ = tx.blocking_send(RawWatchEvent::Upsert(path));
+                            }
+                        }
+                    }
+                    EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+                        if event.paths.len() >= 2 {
+                            let _ = tx.blocking_send(RawWatchEvent::Remove(event.paths[0].clone()));
+                            if Self::is_path_relevant_for_upsert(&event.paths[1]) {
+                                let _ =
+                                    tx.blocking_send(RawWatchEvent::Upsert(event.paths[1].clone()));
+                            }
+                        } else {
+                            for path in event.paths {
+                                let _ = tx.blocking_send(RawWatchEvent::Remove(path));
+                            }
+                        }
+                    }
+                    EventKind::Create(_) | EventKind::Modify(_) => {
+                        for path in event.paths {
+                            if Self::is_path_relevant_for_upsert(&path) {
+                                let _ = tx.blocking_send(RawWatchEvent::Upsert(path));
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         })
@@ -72,21 +113,56 @@ impl DynamicWatcherManager {
                     _ = cancel_token.cancelled() => {
                         break;
                     }
-                    maybe_path = rx.recv() => {
-                        let Some(path) = maybe_path else {
+                    first_event = rx.recv() => {
+                        let Some(first) = first_event else {
                             break;
                         };
+                        let mut batch = vec![first];
+                        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(60);
+
+                        loop {
+                            tokio::select! {
+                                _ = cancel_token.cancelled() => {
+                                    break;
+                                }
+                                _ = tokio::time::sleep_until(deadline) => {
+                                    break;
+                                }
+                                next_event = rx.recv() => {
+                                    if let Some(event) = next_event {
+                                        batch.push(event);
+                                        if batch.len() >= 2048 {
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
                         let inner = match weak_inner.upgrade() {
                             Some(i) => i,
                             None => break,
                         };
-                        Self::dispatch_mutation(&inner, path).await;
+                        Self::dispatch_batch(&inner, batch).await;
                     }
                 }
             }
         });
 
         Ok(Self { inner, token })
+    }
+
+    fn is_path_relevant_for_upsert(path: &Path) -> bool {
+        WorkspaceManifests::is_manifest_path(path)
+            || path.is_dir()
+            || path.extension().is_some_and(|ext| {
+                matches!(
+                    ext.to_str().unwrap_or(""),
+                    "rs" | "ts" | "tsx" | "js" | "jsx" | "go"
+                )
+            })
     }
 
     fn find_best_workspace(
@@ -144,55 +220,208 @@ impl DynamicWatcherManager {
     }
 
     /// Dispatches an observed file modification event to the appropriate matching workspace index.
-    async fn dispatch_mutation(inner: &DynamicWatcherInner, path: PathBuf) {
-        let canonical_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        let Some((target_root, target_ws)) = Self::find_best_workspace(inner, &canonical_path)
-        else {
-            return;
+    pub async fn dispatch_mutation(inner: &DynamicWatcherInner, path: PathBuf) {
+        let event = if path.exists() {
+            RawWatchEvent::Upsert(path)
+        } else {
+            RawWatchEvent::Remove(path)
         };
+        Self::dispatch_batch(inner, vec![event]).await;
+    }
 
-        // Worktree Carve-Out Rule: reject mutations inside nested worktrees when matched to parent repo
-        if Self::is_nested_worktree_mutation(&target_root, &canonical_path, &target_ws.config) {
-            tracing::debug!(
-                path = %canonical_path.display(),
-                "Dropped nested worktree edit from parent workspace index"
-            );
+    /// Dispatches a single raw watch event.
+    pub async fn dispatch_event(inner: &DynamicWatcherInner, event: RawWatchEvent) {
+        Self::dispatch_batch(inner, vec![event]).await;
+    }
+
+    /// Dispatches a coalesced batch of raw watch events across matching registered workspaces.
+    pub async fn dispatch_batch(inner: &DynamicWatcherInner, batch: Vec<RawWatchEvent>) {
+        if batch.is_empty() {
             return;
         }
 
-        // Two-Tier Relative Ignore, Watch-Paths & Extension Check against loaded ProjectConfig
-        if let Ok(rel) = canonical_path.strip_prefix(&target_root) {
-            if target_ws.config.is_relative_path_ignored(rel)
-                || !target_ws.config.is_file_in_watch_paths(rel)
-            {
+        let grouped = Self::group_events_by_workspace(inner, batch);
+        for (target_root, (target_ws, upserted, removed)) in grouped {
+            Self::apply_workspace_batch(target_root, target_ws, upserted, removed).await;
+        }
+    }
+
+    fn group_events_by_workspace(
+        inner: &DynamicWatcherInner,
+        batch: Vec<RawWatchEvent>,
+    ) -> HashMap<PathBuf, (WatchedWorkspace, Vec<PathBuf>, Vec<PathBuf>)> {
+        let mut grouped: HashMap<PathBuf, (WatchedWorkspace, Vec<PathBuf>, Vec<PathBuf>)> =
+            HashMap::new();
+
+        for event in batch {
+            let raw_path = match &event {
+                RawWatchEvent::Upsert(p) | RawWatchEvent::Remove(p) => p,
+            };
+            let canonical_path = canonicalize_best_effort(raw_path);
+            let Some((target_root, target_ws)) = Self::find_best_workspace(inner, &canonical_path)
+            else {
+                continue;
+            };
+
+            if Self::is_nested_worktree_mutation(&target_root, &canonical_path, &target_ws.config) {
                 tracing::debug!(
                     path = %canonical_path.display(),
-                    "Ignored by loaded project configuration"
+                    "Dropped nested worktree edit from parent workspace index"
                 );
+                continue;
+            }
+
+            if let Ok(rel) = canonical_path.strip_prefix(&target_root) {
+                if target_ws.config.is_relative_path_ignored(rel) {
+                    continue;
+                }
+            }
+
+            let entry = grouped
+                .entry(target_root.clone())
+                .or_insert_with(|| (target_ws.clone(), Vec::new(), Vec::new()));
+
+            match event {
+                RawWatchEvent::Remove(_) => {
+                    entry.2.push(canonical_path);
+                }
+                RawWatchEvent::Upsert(_) => {
+                    if !canonical_path.exists() {
+                        entry.2.push(canonical_path);
+                    } else {
+                        Self::route_upsert_path(
+                            &target_root,
+                            &canonical_path,
+                            &target_ws,
+                            &mut entry.1,
+                        );
+                    }
+                }
+            }
+        }
+
+        grouped
+    }
+
+    fn route_upsert_path(
+        target_root: &Path,
+        canonical_path: &Path,
+        target_ws: &WatchedWorkspace,
+        upserted: &mut Vec<PathBuf>,
+    ) {
+        if let Ok(rel) = canonical_path.strip_prefix(target_root) {
+            if !WorkspaceManifests::is_manifest_path(canonical_path)
+                && !target_ws.config.is_file_in_watch_paths(rel)
+            {
                 return;
             }
         }
-        let ext_enabled = canonical_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|ext| target_ws.config.is_extension_enabled(ext));
-        if !ext_enabled {
+
+        if canonical_path.is_dir() {
+            let files = cortx_distill::SymbolIndex::new()
+                .collect_source_files_for_project(canonical_path, &target_ws.config);
+            upserted.extend(files);
+        } else {
+            let is_manifest = WorkspaceManifests::is_manifest_path(canonical_path);
+            let ext_enabled = canonical_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| target_ws.config.is_extension_enabled(ext));
+            if is_manifest || ext_enabled {
+                upserted.push(canonical_path.to_path_buf());
+            }
+        }
+    }
+
+    async fn apply_workspace_batch(
+        target_root: PathBuf,
+        target_ws: WatchedWorkspace,
+        mut upserted: Vec<PathBuf>,
+        mut removed: Vec<PathBuf>,
+    ) {
+        upserted.sort_unstable();
+        upserted.dedup();
+        removed.sort_unstable();
+        removed.dedup();
+
+        if upserted.is_empty() && removed.is_empty() {
             return;
         }
 
-        let start = std::time::Instant::now();
-        if let Ok(content) = std::fs::read_to_string(&canonical_path) {
-            let path_str = canonical_path.to_string_lossy().to_string();
-            let mut guard = target_ws.index.write().await;
-            let _ = guard.index_any_source_str(&path_str, &content);
-            drop(guard);
-            let elapsed_ms = start.elapsed().as_millis();
-            tracing::debug!(path = %path.display(), elapsed_ms, "Symbol index updated");
-            let rel_display = path.strip_prefix(&target_root).unwrap_or(&path).display();
-            target_ws.logger.log(&format!(
-                "[DEBUG] File modified: '{}' -> updated symbol index in {}ms",
-                rel_display, elapsed_ms
+        let (mut snapshot, shadowed_files_lock, logger, config) = {
+            let guard = target_ws.index.read().await;
+            (
+                guard.clone(),
+                Arc::clone(&target_ws.shadowed_files),
+                Arc::clone(&target_ws.logger),
+                target_ws.config.clone(),
+            )
+        };
+
+        if snapshot.manifests.workspace_root == Path::new(".") && target_root != Path::new(".") {
+            snapshot.manifests = Arc::new(WorkspaceManifests::discover(
+                &target_root,
+                &config.ignored_dirs,
             ));
+        }
+
+        let start = std::time::Instant::now();
+        let upserted_cloned = upserted.clone();
+        let removed_cloned = removed.clone();
+        let config_cloned = config.clone();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            snapshot.apply_watch_batch(WatchBatchUpdate {
+                upserted: &upserted_cloned,
+                removed: &removed_cloned,
+                project_cfg: Some(&config_cloned),
+            })
+        })
+        .await;
+
+        if let Ok(outcome) = outcome {
+            {
+                let mut sf = shadowed_files_lock.write().await;
+                for rem in &removed {
+                    if let Ok(rel) = rem.strip_prefix(&target_root) {
+                        sf.insert(rel.to_path_buf());
+                    }
+                }
+                for ups in &upserted {
+                    if let Ok(rel) = ups.strip_prefix(&target_root) {
+                        sf.insert(rel.to_path_buf());
+                    }
+                }
+            }
+
+            {
+                let mut guard = target_ws.index.write().await;
+                *guard = outcome.next_index;
+            }
+
+            let elapsed_ms = start.elapsed().as_millis();
+            tracing::debug!(
+                root = %target_root.display(),
+                upserted = upserted.len(),
+                removed = removed.len(),
+                elapsed_ms,
+                "Symbol index updated via coalesced watcher batch"
+            );
+
+            for ups in &upserted {
+                let rel_display = ups.strip_prefix(&target_root).unwrap_or(ups).display();
+                logger.log(&format!(
+                    "[DEBUG] File modified: '{}' -> updated symbol index in {}ms",
+                    rel_display, elapsed_ms
+                ));
+            }
+            for rem in &removed {
+                let rel_display = rem.strip_prefix(&target_root).unwrap_or(rem).display();
+                logger.log(&format!(
+                    "[DEBUG] File removed: '{}' -> updated symbol index in {}ms",
+                    rel_display, elapsed_ms
+                ));
+            }
         }
     }
 
@@ -215,6 +444,24 @@ impl DynamicWatcherManager {
         &self,
         root: PathBuf,
         index: Arc<TokioRwLock<SymbolIndex>>,
+        logger: Arc<WorkspaceLogger>,
+        config: cortx_core::ProjectConfig,
+    ) -> Result<(), DaemonError> {
+        self.watch_workspace_with_shadowed_files(
+            root,
+            index,
+            Arc::new(TokioRwLock::new(HashSet::new())),
+            logger,
+            config,
+        )
+    }
+
+    /// Dynamically registers a workspace root with an explicit `shadowed_files` tombstone set.
+    pub fn watch_workspace_with_shadowed_files(
+        &self,
+        root: PathBuf,
+        index: Arc<TokioRwLock<SymbolIndex>>,
+        shadowed_files: Arc<TokioRwLock<HashSet<PathBuf>>>,
         logger: Arc<WorkspaceLogger>,
         config: cortx_core::ProjectConfig,
     ) -> Result<(), DaemonError> {
@@ -250,6 +497,7 @@ impl DynamicWatcherManager {
                 canonical_root.clone(),
                 WatchedWorkspace {
                     index,
+                    shadowed_files,
                     logger,
                     config,
                 },
@@ -258,6 +506,17 @@ impl DynamicWatcherManager {
 
         tracing::info!(root = %canonical_root.display(), "Workspace registered for file watching");
         Ok(())
+    }
+
+    /// Returns the shadowed files set for a given workspace root, if registered.
+    pub fn shadowed_files(&self, root: &Path) -> Option<Arc<TokioRwLock<HashSet<PathBuf>>>> {
+        let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        self.inner
+            .workspaces
+            .read()
+            .ok()?
+            .get(&canonical_root)
+            .map(|w| Arc::clone(&w.shadowed_files))
     }
 
     /// Dynamically unregisters a workspace root and detaches its filesystem watch.
@@ -617,6 +876,135 @@ pub mod tests {
                 .await
                 .symbols_map
                 .contains_key("unwatched_outside_src")
+        );
+
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_watcher_unlink_eviction() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let main_file = src.join("main.rs");
+        let helper_file = src.join("helper.rs");
+        std::fs::write(&main_file, "pub fn main_runner() {}").unwrap();
+        std::fs::write(&helper_file, "pub fn helper_tool() {}").unwrap();
+
+        let mut index = SymbolIndex::new();
+        index.index_directory(&root).unwrap();
+        assert!(index.symbols_map.contains_key("helper_tool"));
+
+        let idx = Arc::new(TokioRwLock::new(index));
+        let token = CancellationToken::new();
+        let manager = DynamicWatcherManager::new(token.clone()).unwrap();
+        let logger = Arc::new(WorkspaceLogger::noop(root.clone()));
+
+        manager
+            .watch_workspace(root.clone(), Arc::clone(&idx), logger)
+            .unwrap();
+
+        // Unlink helper.rs
+        std::fs::remove_file(&helper_file).unwrap();
+        DynamicWatcherManager::dispatch_event(&manager.inner, RawWatchEvent::Remove(helper_file))
+            .await;
+
+        let guard = idx.read().await;
+        assert!(
+            !guard.symbols_map.contains_key("helper_tool"),
+            "helper_tool should be evicted after unlink"
+        );
+        assert!(
+            guard.symbols_map.contains_key("main_runner"),
+            "main_runner should remain"
+        );
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_watcher_rm_rf_directory_prefix_eviction() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let src = root.join("src");
+        let sub = src.join("features");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let main_file = src.join("main.rs");
+        let feat_file = sub.join("feat.rs");
+        std::fs::write(&main_file, "pub fn main_app() {}").unwrap();
+        std::fs::write(&feat_file, "pub fn feature_sub() {}").unwrap();
+
+        let mut index = SymbolIndex::new();
+        index.index_directory(&root).unwrap();
+        assert!(index.symbols_map.contains_key("feature_sub"));
+
+        let idx = Arc::new(TokioRwLock::new(index));
+        let token = CancellationToken::new();
+        let manager = DynamicWatcherManager::new(token.clone()).unwrap();
+        let logger = Arc::new(WorkspaceLogger::noop(root.clone()));
+
+        manager
+            .watch_workspace(root.clone(), Arc::clone(&idx), logger)
+            .unwrap();
+
+        // rm -rf features
+        std::fs::remove_dir_all(&sub).unwrap();
+        DynamicWatcherManager::dispatch_event(&manager.inner, RawWatchEvent::Remove(sub)).await;
+
+        let guard = idx.read().await;
+        assert!(
+            !guard.symbols_map.contains_key("feature_sub"),
+            "feature_sub should be evicted after rm -rf directory"
+        );
+        assert!(
+            guard.symbols_map.contains_key("main_app"),
+            "main_app should remain"
+        );
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_watcher_worktree_deletion_tombstones() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let lib_file = src.join("lib.rs");
+        let deleted_file = src.join("deleted.rs");
+        std::fs::write(&lib_file, "pub fn live_lib() {}").unwrap();
+        std::fs::write(&deleted_file, "pub fn to_delete() {}").unwrap();
+
+        let mut index = SymbolIndex::new();
+        index.index_directory(&root).unwrap();
+
+        let idx = Arc::new(TokioRwLock::new(index));
+        let shadowed_files = Arc::new(TokioRwLock::new(HashSet::new()));
+        let token = CancellationToken::new();
+        let manager = DynamicWatcherManager::new(token.clone()).unwrap();
+        let logger = Arc::new(WorkspaceLogger::noop(root.clone()));
+
+        manager
+            .watch_workspace_with_shadowed_files(
+                root.clone(),
+                Arc::clone(&idx),
+                Arc::clone(&shadowed_files),
+                logger,
+                cortx_core::ProjectConfig::default(),
+            )
+            .unwrap();
+
+        // Unlink deleted.rs
+        std::fs::remove_file(&deleted_file).unwrap();
+        DynamicWatcherManager::dispatch_event(&manager.inner, RawWatchEvent::Remove(deleted_file))
+            .await;
+
+        let sf = shadowed_files.read().await;
+        assert!(
+            sf.contains(Path::new("src/deleted.rs")),
+            "shadowed_files must contain src/deleted.rs tombstone"
         );
 
         token.cancel();

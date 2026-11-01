@@ -7,7 +7,7 @@
 use crate::error::DaemonError;
 use crate::logging::{DaemonLogManager, WorkspaceLogger};
 use cortx_distill::SymbolIndex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +32,8 @@ pub struct WorkspaceEntry {
     pub index: Arc<RwLock<SymbolIndex>>,
     /// Shared base repository symbol index if this entry is a worktree overlay.
     pub base_index: Option<Arc<RwLock<SymbolIndex>>>,
+    /// Relative paths of files modified or deleted in this worktree relative to parent.
+    pub shadowed_files: Arc<RwLock<HashSet<PathBuf>>>,
     /// Dedicated file logger for this workspace.
     pub logger: Arc<WorkspaceLogger>,
     /// Total successful advisory context submissions for this workspace.
@@ -44,6 +46,12 @@ pub struct WorkspaceEntry {
     pub macro_reads: AtomicU64,
     /// Total micro reads (focused inspections <= 150 lines).
     pub micro_reads: AtomicU64,
+    /// Total micro reads with omitted advisory output.
+    pub omitted_micro_reads: AtomicU64,
+    /// Total full-file reads with omitted self-skeletons.
+    pub omitted_full_read_skeletons: AtomicU64,
+    /// Total advisories trimmed to wire character budget.
+    pub trimmed_advisories: AtomicU64,
     /// Timestamp of last activity or hook evaluation.
     last_accessed: std::sync::Mutex<std::time::Instant>,
 }
@@ -67,12 +75,16 @@ impl WorkspaceEntry {
             parent_repo,
             index,
             base_index,
+            shadowed_files: Arc::new(RwLock::new(HashSet::new())),
             logger,
             submissions: AtomicU64::new(0),
             callgraph_drops: AtomicU64::new(0),
             ast_drops: AtomicU64::new(0),
             macro_reads: AtomicU64::new(0),
             micro_reads: AtomicU64::new(0),
+            omitted_micro_reads: AtomicU64::new(0),
+            omitted_full_read_skeletons: AtomicU64::new(0),
+            trimmed_advisories: AtomicU64::new(0),
             last_accessed: std::sync::Mutex::new(std::time::Instant::now()),
         }
     }
@@ -87,6 +99,12 @@ impl WorkspaceEntry {
         self.project_name = project_name;
         self.config_path = config_path;
         self.config = config;
+        self
+    }
+
+    /// Attaches shadowed files (modified or deleted worktree files relative to parent).
+    pub fn with_shadowed_files(mut self, shadowed_files: Arc<RwLock<HashSet<PathBuf>>>) -> Self {
+        self.shadowed_files = shadowed_files;
         self
     }
 
@@ -166,17 +184,50 @@ impl WorkspaceEntry {
     pub fn micro_reads(&self) -> u64 {
         self.micro_reads.load(Ordering::Relaxed)
     }
+
+    /// Increments the count of omitted micro-read advisories.
+    pub fn record_omitted_micro_read(&self) {
+        self.omitted_micro_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increments the count of omitted full-read skeletons.
+    pub fn record_omitted_full_read_skeleton(&self) {
+        self.omitted_full_read_skeletons
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increments the count of trimmed advisories.
+    pub fn record_trimmed_advisory(&self) {
+        self.trimmed_advisories.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the total omitted micro-read count for this workspace.
+    pub fn omitted_micro_reads(&self) -> u64 {
+        self.omitted_micro_reads.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total omitted full-read skeletons count for this workspace.
+    pub fn omitted_full_read_skeletons(&self) -> u64 {
+        self.omitted_full_read_skeletons.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total trimmed advisories count for this workspace.
+    pub fn trimmed_advisories(&self) -> u64 {
+        self.trimmed_advisories.load(Ordering::Relaxed)
+    }
 }
 
-/// Detects added or modified files in a worktree relative to its parent repository.
-fn detect_worktree_modified_files(
+/// Detects added or modified files in a worktree and records shadowed (modified or deleted) files.
+fn detect_worktree_changes(
     worktree_root: &Path,
     parent_repo: &Path,
     project: &cortx_core::ProjectConfig,
-) -> Vec<PathBuf> {
+    base_idx: &SymbolIndex,
+) -> (Vec<PathBuf>, HashSet<PathBuf>) {
     let dummy_idx = SymbolIndex::new();
     let wt_files = dummy_idx.collect_source_files_for_project(worktree_root, project);
     let mut modified = Vec::new();
+    let mut shadowed = HashSet::new();
 
     for file in wt_files {
         if let Ok(rel) = file.strip_prefix(worktree_root) {
@@ -186,24 +237,58 @@ fn detect_worktree_modified_files(
             } else {
                 let wt_meta = std::fs::metadata(&file).ok();
                 let p_meta = std::fs::metadata(&parent_file).ok();
-                match (wt_meta, p_meta) {
+                let is_diff = match (wt_meta, p_meta) {
                     (Some(wm), Some(pm)) => {
                         if wm.len() != pm.len() || wm.modified().ok() != pm.modified().ok() {
-                            modified.push(file);
+                            true
                         } else if let (Ok(c1), Ok(c2)) =
                             (std::fs::read(&file), std::fs::read(&parent_file))
                         {
-                            if c1 != c2 {
-                                modified.push(file);
-                            }
+                            c1 != c2
+                        } else {
+                            false
                         }
                     }
-                    _ => modified.push(file),
+                    _ => true,
+                };
+                if is_diff {
+                    shadowed.insert(rel.to_path_buf());
+                    modified.push(file);
                 }
             }
         }
     }
-    modified
+
+    // Check parent indexed files for deletions in worktree
+    for p in base_idx
+        .file_facts
+        .keys()
+        .chain(base_idx.file_symbols.keys())
+    {
+        let rel = p.strip_prefix(parent_repo).unwrap_or(p);
+        if !rel.as_os_str().is_empty() && !worktree_root.join(rel).exists() {
+            shadowed.insert(rel.to_path_buf());
+        }
+    }
+    for p_str in base_idx.file_to_symbols.keys() {
+        let p = Path::new(p_str);
+        let rel = p.strip_prefix(parent_repo).unwrap_or(p);
+        if !rel.as_os_str().is_empty() && !worktree_root.join(rel).exists() {
+            shadowed.insert(rel.to_path_buf());
+        }
+    }
+    if base_idx.file_facts.is_empty() && base_idx.file_symbols.is_empty() {
+        let parent_files = dummy_idx.collect_source_files_for_project(parent_repo, project);
+        for p in parent_files {
+            if let Ok(rel) = p.strip_prefix(parent_repo) {
+                if !worktree_root.join(rel).exists() {
+                    shadowed.insert(rel.to_path_buf());
+                }
+            }
+        }
+    }
+
+    (modified, shadowed)
 }
 
 type InFlightMap =
@@ -288,12 +373,9 @@ impl WorkspaceRegistry {
         let canonical_root = std::fs::canonicalize(&raw_root).unwrap_or(raw_root);
 
         // 1. Fast path: check existing entries
-        {
-            let guard = self.entries.read().await;
-            if let Some(entry) = guard.get(&canonical_root) {
-                entry.touch();
-                return Ok(entry.clone());
-            }
+        if let Some(entry) = self.get(&canonical_root).await {
+            entry.touch();
+            return Ok(entry);
         }
 
         // 2. Single-flight coordination
@@ -398,26 +480,33 @@ impl WorkspaceRegistry {
             cfg_label
         ));
 
-        let (index, base_index) = if let Some(ref parent) = parent_repo {
+        let (index, base_index, shadowed_files) = if let Some(ref parent) = parent_repo {
             // Ensure parent repo is initialized recursively
             let parent_entry = Box::pin(self.get_or_init(parent)).await?;
             let base = parent_entry.index.clone();
 
-            let modified_files =
-                detect_worktree_modified_files(canonical_root, parent, &project_config);
+            let (modified_files, shadowed) = {
+                let base_guard = base.read().await;
+                detect_worktree_changes(canonical_root, parent, &project_config, &base_guard)
+            };
             let overlay = {
                 let base_guard = base.read().await;
                 base_guard.create_overlay(&modified_files)
             };
 
             logger.log(&format!(
-                "Overlay indexed {} modified files against parent '{}' in {:?}",
+                "Overlay indexed {} modified files against parent '{}' with {} shadowed files in {:?}",
                 modified_files.len(),
                 parent.display(),
+                shadowed.len(),
                 start_time.elapsed()
             ));
 
-            (Arc::new(RwLock::new(overlay)), Some(base))
+            (
+                Arc::new(RwLock::new(overlay)),
+                Some(base),
+                Arc::new(RwLock::new(shadowed)),
+            )
         } else {
             let mut idx = SymbolIndex::new();
             let indexed_files =
@@ -431,7 +520,11 @@ impl WorkspaceRegistry {
                 start_time.elapsed()
             ));
 
-            (Arc::new(RwLock::new(idx)), None)
+            (
+                Arc::new(RwLock::new(idx)),
+                None,
+                Arc::new(RwLock::new(HashSet::new())),
+            )
         };
 
         let entry = Arc::new(
@@ -443,6 +536,7 @@ impl WorkspaceRegistry {
                 base_index,
                 logger,
             )
+            .with_shadowed_files(shadowed_files)
             .with_project_metadata(project_name, config_path, project_config),
         );
 
@@ -523,6 +617,7 @@ impl WorkspaceRegistry {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use cortx_distill::OverlayView;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -644,6 +739,96 @@ pub mod tests {
         // Overlay should contain overlay function
         let wt_guard = wt_entry.index.read().await;
         assert!(wt_guard.symbols_map.contains_key("run_overlay"));
+        drop(wt_guard);
+
+        let shadowed = wt_entry.shadowed_files.read().await;
+        assert!(shadowed.contains(Path::new("src/lib.rs")));
+    }
+
+    #[tokio::test]
+    async fn test_worktree_deletion_masking() {
+        let log_dir = tempdir().unwrap();
+        let parent_repo = tempdir().unwrap();
+        let canonical_parent = std::fs::canonicalize(parent_repo.path()).unwrap();
+
+        let parent_git = canonical_parent.join(".git");
+        std::fs::create_dir_all(&parent_git).unwrap();
+        let parent_src = canonical_parent.join("src");
+        std::fs::create_dir_all(&parent_src).unwrap();
+        std::fs::write(
+            parent_src.join("lib.rs"),
+            "pub struct ActiveEngine; pub fn run_active() {}",
+        )
+        .unwrap();
+        std::fs::write(
+            parent_src.join("deleted.rs"),
+            "pub struct DeletedEngine; pub fn run_deleted() {}",
+        )
+        .unwrap();
+
+        let worktrees_git = parent_git.join("worktrees").join("feat-del");
+        std::fs::create_dir_all(&worktrees_git).unwrap();
+        std::fs::write(worktrees_git.join("commondir"), "../..\n").unwrap();
+
+        let worktree_dir = tempdir().unwrap();
+        let canonical_wt = std::fs::canonicalize(worktree_dir.path()).unwrap();
+        let wt_git_file = canonical_wt.join(".git");
+        std::fs::write(
+            &wt_git_file,
+            format!("gitdir: {}\n", worktrees_git.display()),
+        )
+        .unwrap();
+
+        // Worktree only contains lib.rs; deleted.rs is omitted (deleted in worktree)
+        let wt_src = canonical_wt.join("src");
+        std::fs::create_dir_all(&wt_src).unwrap();
+        std::fs::write(
+            wt_src.join("lib.rs"),
+            "pub struct ActiveEngine; pub fn run_active() {}",
+        )
+        .unwrap();
+
+        let log_manager = Arc::new(DaemonLogManager::init(log_dir.path()).unwrap());
+        let registry = WorkspaceRegistry::new(log_manager);
+
+        // Non-initializing lookup returns None before initialization
+        assert!(registry.get(&canonical_wt).await.is_none());
+
+        let wt_entry = registry
+            .get_or_init(&canonical_wt)
+            .await
+            .expect("worktree cold start should succeed");
+
+        // Non-initializing lookup returns Some after initialization
+        assert!(registry.get(&canonical_wt).await.is_some());
+
+        assert!(wt_entry.is_worktree);
+        assert_eq!(wt_entry.parent_repo, Some(canonical_parent));
+        assert!(wt_entry.base_index.is_some());
+
+        // shadowed_files must contain the relative path of deleted.rs
+        let shadowed = wt_entry.shadowed_files.read().await;
+        assert!(
+            shadowed.contains(Path::new("src/deleted.rs")),
+            "shadowed_files must contain deleted parent file"
+        );
+        drop(shadowed);
+
+        // Verify that OverlayView masks out deleted symbols
+        let base_guard = wt_entry.base_index.as_ref().unwrap().read().await;
+        assert!(base_guard.symbols_map.contains_key("run_deleted"));
+
+        let ov_guard = wt_entry.index.read().await;
+        let shadowed_guard = wt_entry.shadowed_files.read().await;
+        let view = OverlayView {
+            base: Some(&*base_guard),
+            overlay: Some(&*ov_guard),
+            shadowed_files: Some(&*shadowed_guard),
+        };
+
+        assert!(view.is_shadowed("src/deleted.rs"));
+        assert!(view.get_symbol_defs("run_deleted").is_empty());
+        assert!(!view.get_symbol_defs("run_active").is_empty());
     }
 
     #[tokio::test]

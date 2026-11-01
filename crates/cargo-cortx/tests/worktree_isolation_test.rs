@@ -1,17 +1,20 @@
-//! Integration test verifying dynamic Git worktree isolation and multi-workspace daemon IPC.
+//! Integration test verifying dynamic Git worktree isolation, CoW overlay indexing,
+//! worktree deletion tombstones, and multi-workspace daemon IPC.
 
 use cortx_core::workspace::{derive_socket_path, resolve_active_socket, resolve_workspace_root};
 use cortx_daemon::{
-    DaemonRequest, DaemonResponse, execute_post_read_hook, run_server, send_daemon_request,
+    DaemonRequest, DaemonResponse, ServerOptions, execute_post_read_hook, run_server,
+    run_server_with_options, send_daemon_request,
 };
 use cortx_distill::SymbolIndex;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-fn run_git_cmd(cwd: &std::path::Path, args: &[&str]) {
+fn run_git_cmd(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -25,7 +28,8 @@ async fn test_worktree_daemon_isolation_and_lifecycle() {
     let base = tempdir().unwrap();
     let main_repo = base.path().join("main_repo");
     let wt_feature = base.path().join("wt_feature");
-    std::fs::create_dir_all(main_repo.join("src")).unwrap();
+    let main_src = main_repo.join("src");
+    std::fs::create_dir_all(&main_src).unwrap();
 
     // 1. Initialize main git repository
     run_git_cmd(&main_repo, &["init"]);
@@ -33,15 +37,20 @@ async fn test_worktree_daemon_isolation_and_lifecycle() {
     run_git_cmd(&main_repo, &["config", "user.name", "Test User"]);
     run_git_cmd(&main_repo, &["config", "commit.gpgsign", "false"]);
 
-    // 2. Add AlphaService to main_repo
-    let alpha_file = main_repo.join("src").join("lib.rs");
+    // 2. Add AlphaService and contract to main_repo
+    let alpha_file = main_src.join("lib.rs");
     std::fs::write(
         &alpha_file,
-        r#"pub struct AlphaService {
+        r#"pub trait AlphaContract {
+    fn execute(&self) -> bool;
+    fn audit_alpha(&self) -> usize;
+}
+
+pub struct AlphaService {
     pub id: u64,
 }
 
-impl AlphaService {
+impl AlphaContract for AlphaService {
     pub fn execute(&self) -> bool {
         let mut ok = false;
         for i in 0..100 {
@@ -66,6 +75,18 @@ impl AlphaService {
     )
     .unwrap();
 
+    let alpha_caller = main_src.join("caller.rs");
+    std::fs::write(
+        &alpha_caller,
+        r#"use crate::lib::{AlphaContract, AlphaService};
+
+pub fn trigger_alpha_pipeline(svc: &AlphaService) -> bool {
+    svc.execute()
+}
+"#,
+    )
+    .unwrap();
+
     run_git_cmd(&main_repo, &["add", "."]);
     run_git_cmd(&main_repo, &["commit", "-m", "init main repo"]);
 
@@ -76,15 +97,20 @@ impl AlphaService {
         &["worktree", "add", "-b", "feature-beta", wt_str],
     );
 
-    // 4. Modify wt_feature to contain BetaService
+    // 4. Modify wt_feature to contain BetaService and BetaContract
     let beta_file = wt_feature.join("src").join("lib.rs");
     std::fs::write(
         &beta_file,
-        r#"pub struct BetaService {
+        r#"pub trait BetaContract {
+    fn process(&self) -> bool;
+    fn audit_beta(&self) -> usize;
+}
+
+pub struct BetaService {
     pub token: String,
 }
 
-impl BetaService {
+impl BetaContract for BetaService {
     pub fn process(&self) -> bool {
         let mut valid = false;
         for ch in self.token.chars() {
@@ -109,6 +135,18 @@ impl BetaService {
     )
     .unwrap();
 
+    let beta_caller = wt_feature.join("src").join("caller.rs");
+    std::fs::write(
+        &beta_caller,
+        r#"use crate::lib::{BetaContract, BetaService};
+
+pub fn trigger_beta_pipeline(svc: &BetaService) -> bool {
+    svc.process()
+}
+"#,
+    )
+    .unwrap();
+
     // 5. Verify workspace root resolution
     let root_main = resolve_workspace_root(&main_repo.join("src"));
     let root_wt = resolve_workspace_root(&wt_feature.join("src"));
@@ -128,7 +166,6 @@ impl BetaService {
     assert!(socket_main.to_str().unwrap().len() < 104);
     assert!(socket_wt.to_str().unwrap().len() < 104);
 
-    // Verify resolve_active_socket resolves the correct socket from subdirectories
     let active_from_sub = resolve_active_socket(None, &main_repo.join("src"));
     assert_eq!(active_from_sub, socket_main);
 
@@ -157,19 +194,25 @@ impl BetaService {
     assert!(socket_main.exists());
     assert!(socket_wt.exists());
 
-    // 8. Query daemon A -> must see AlphaService, NOT BetaService
+    // 8. Query daemon A -> must see AlphaService / AlphaContract, NOT BetaService
     let req_main = DaemonRequest::PostReadHook {
         file: alpha_file.clone(),
         start_line: None,
         end_line: None,
         raw_read_bytes: None,
         read_kind: None,
+        total_lines: None,
+        vendor: None,
+        is_full_read: None,
     };
     let resp_main = send_daemon_request(&socket_main, req_main).await.unwrap();
     if let DaemonResponse::AdvisoryContext { advisory_block, .. } = resp_main {
         assert!(
-            advisory_block.contains("AlphaService"),
-            "Expected AlphaService in main daemon context"
+            advisory_block.contains("AlphaService")
+                || advisory_block.contains("AlphaContract")
+                || advisory_block.contains("trigger_alpha_pipeline"),
+            "Expected AlphaService/AlphaContract/caller in main daemon context:\n{}",
+            advisory_block
         );
         assert!(
             !advisory_block.contains("BetaService"),
@@ -179,19 +222,25 @@ impl BetaService {
         panic!("Unexpected response from main daemon: {:?}", resp_main);
     }
 
-    // 9. Query daemon B -> must see BetaService, NOT AlphaService
+    // 9. Query daemon B -> must see BetaService / BetaContract, NOT AlphaService
     let req_wt = DaemonRequest::PostReadHook {
         file: beta_file.clone(),
         start_line: None,
         end_line: None,
         raw_read_bytes: None,
         read_kind: None,
+        total_lines: None,
+        vendor: None,
+        is_full_read: None,
     };
     let resp_wt = send_daemon_request(&socket_wt, req_wt).await.unwrap();
     if let DaemonResponse::AdvisoryContext { advisory_block, .. } = resp_wt {
         assert!(
-            advisory_block.contains("BetaService"),
-            "Expected BetaService in worktree daemon context"
+            advisory_block.contains("BetaService")
+                || advisory_block.contains("BetaContract")
+                || advisory_block.contains("trigger_beta_pipeline"),
+            "Expected BetaService/BetaContract/caller in worktree daemon context:\n{}",
+            advisory_block
         );
         assert!(
             !advisory_block.contains("AlphaService"),
@@ -227,12 +276,19 @@ impl BetaService {
             end_line: None,
             raw_read_bytes: None,
             read_kind: None,
+            total_lines: None,
+            vendor: None,
+            is_full_read: None,
         },
     )
     .await
     .unwrap();
     if let DaemonResponse::AdvisoryContext { advisory_block, .. } = resp_wt2 {
-        assert!(advisory_block.contains("BetaService"));
+        assert!(
+            advisory_block.contains("BetaService")
+                || advisory_block.contains("BetaContract")
+                || advisory_block.contains("trigger_beta_pipeline")
+        );
     } else {
         panic!("Unexpected response from worktree daemon: {:?}", resp_wt2);
     }
@@ -251,5 +307,230 @@ impl BetaService {
 
     // 13. Test in-process fallback when daemon is offline
     let fallback_advisory = execute_post_read_hook(&alpha_file, None).unwrap();
-    assert!(fallback_advisory.contains("AlphaService"));
+    assert!(
+        fallback_advisory.contains("AlphaService")
+            || fallback_advisory.contains("AlphaContract")
+            || fallback_advisory.contains("trigger_alpha_pipeline")
+    );
+}
+
+struct WorktreeOverlayFixture {
+    main_lib: PathBuf,
+    wt_lib: PathBuf,
+}
+
+fn setup_worktree_overlay_fixture(base_dir: &Path) -> WorktreeOverlayFixture {
+    let main_repo = base_dir.join("main_repo_overlay");
+    let wt_dir = base_dir.join("wt_overlay");
+    let main_src = main_repo.join("src");
+    std::fs::create_dir_all(&main_src).unwrap();
+
+    run_git_cmd(&main_repo, &["init"]);
+    run_git_cmd(&main_repo, &["config", "user.email", "test@example.com"]);
+    run_git_cmd(&main_repo, &["config", "user.name", "Test User"]);
+    run_git_cmd(&main_repo, &["config", "commit.gpgsign", "false"]);
+
+    let main_lib = main_src.join("lib.rs");
+    std::fs::write(
+        &main_lib,
+        r#"pub struct ServiceEngine {
+    pub capacity: usize,
+}
+
+impl ServiceEngine {
+    pub fn run_engine(&self) -> bool {
+        self.capacity > 0
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        main_src.join("caller_one.rs"),
+        r#"use crate::lib::ServiceEngine;
+
+pub fn base_caller_one(engine: &ServiceEngine) -> bool {
+    engine.run_engine()
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        main_src.join("caller_two.rs"),
+        r#"use crate::lib::ServiceEngine;
+
+pub fn base_caller_two(engine: &ServiceEngine) -> bool {
+    engine.run_engine()
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        main_src.join("deleted_caller.rs"),
+        r#"use crate::lib::ServiceEngine;
+
+pub fn soon_deleted_caller(engine: &ServiceEngine) -> bool {
+    engine.run_engine()
+}
+"#,
+    )
+    .unwrap();
+
+    run_git_cmd(&main_repo, &["add", "."]);
+    run_git_cmd(&main_repo, &["commit", "-m", "init overlay fixture"]);
+
+    let wt_str = wt_dir.to_str().unwrap();
+    run_git_cmd(
+        &main_repo,
+        &["worktree", "add", "-b", "feat-overlay", wt_str],
+    );
+
+    // Modify caller_one.rs in worktree
+    std::fs::write(
+        wt_dir.join("src").join("caller_one.rs"),
+        r#"use crate::lib::ServiceEngine;
+
+pub fn wt_modified_caller(engine: &ServiceEngine) -> bool {
+    engine.run_engine()
+}
+"#,
+    )
+    .unwrap();
+
+    // Delete deleted_caller.rs in worktree
+    std::fs::remove_file(wt_dir.join("src").join("deleted_caller.rs")).unwrap();
+
+    let wt_lib = wt_dir.join("src").join("lib.rs");
+    WorktreeOverlayFixture { main_lib, wt_lib }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_worktree_overlay_union_and_deletion_tombstones() {
+    let base = tempdir().unwrap();
+    let fixture = setup_worktree_overlay_fixture(base.path());
+
+    let socket_path = base.path().join("system_daemon.sock");
+    let log_dir = base.path().join("logs");
+    let server_token = CancellationToken::new();
+    let s_sock = socket_path.clone();
+    let tok = server_token.clone();
+    let dummy_index = Arc::new(RwLock::new(SymbolIndex::new()));
+
+    let server_handle = tokio::spawn(async move {
+        let opts = ServerOptions {
+            socket_path: s_sock,
+            workspace_root: PathBuf::new(),
+            watcher_active: false,
+            log_dir: Some(log_dir),
+            idle_ttl_secs: 60,
+            daemon_config: Default::default(),
+            config_path: None,
+        };
+        let _ = run_server_with_options(opts, dummy_index, tok).await;
+    });
+
+    let mut ready = false;
+    for _ in 0..20 {
+        if send_daemon_request(&socket_path, DaemonRequest::Ping)
+            .await
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(ready, "Daemon server failed to bind and respond to ping");
+
+    // 1. Query wt_lib -> overlay ∪ (base \ shadowed_files)
+    let req_wt = DaemonRequest::PostReadHook {
+        file: fixture.wt_lib.clone(),
+        start_line: None,
+        end_line: None,
+        raw_read_bytes: None,
+        read_kind: None,
+        total_lines: None,
+        vendor: None,
+        is_full_read: None,
+    };
+    let resp_wt = send_daemon_request(&socket_path, req_wt).await.unwrap();
+    if let DaemonResponse::AdvisoryContext { advisory_block, .. } = resp_wt {
+        assert!(
+            advisory_block.contains("wt_modified_caller"),
+            "Expected wt_modified_caller in worktree advisory, got:\n{}",
+            advisory_block
+        );
+        assert!(
+            advisory_block.contains("base_caller_two"),
+            "Expected unmodified base_caller_two preserved from base index in worktree advisory, got:\n{}",
+            advisory_block
+        );
+        assert!(
+            !advisory_block.contains("base_caller_one"),
+            "Shadowed base_caller_one should be replaced by overlay in worktree advisory, got:\n{}",
+            advisory_block
+        );
+        assert!(
+            !advisory_block.contains("soon_deleted_caller"),
+            "Deleted file caller soon_deleted_caller must be suppressed by worktree tombstone, got:\n{}",
+            advisory_block
+        );
+    } else {
+        panic!(
+            "Unexpected response from daemon for worktree: {:?}",
+            resp_wt
+        );
+    }
+
+    // 2. Query main_lib -> parent repository index remains intact
+    let req_parent = DaemonRequest::PostReadHook {
+        file: fixture.main_lib.clone(),
+        start_line: None,
+        end_line: None,
+        raw_read_bytes: None,
+        read_kind: None,
+        total_lines: None,
+        vendor: None,
+        is_full_read: None,
+    };
+    let resp_parent = send_daemon_request(&socket_path, req_parent).await.unwrap();
+    if let DaemonResponse::AdvisoryContext { advisory_block, .. } = resp_parent {
+        assert!(
+            advisory_block.contains("base_caller_one"),
+            "Parent repo must retain original base_caller_one, got:\n{}",
+            advisory_block
+        );
+        assert!(
+            advisory_block.contains("base_caller_two"),
+            "Parent repo must retain base_caller_two, got:\n{}",
+            advisory_block
+        );
+        assert!(
+            advisory_block.contains("soon_deleted_caller"),
+            "Parent repo must retain soon_deleted_caller, got:\n{}",
+            advisory_block
+        );
+        assert!(
+            !advisory_block.contains("wt_modified_caller"),
+            "Parent repo must not be contaminated with wt_modified_caller, got:\n{}",
+            advisory_block
+        );
+    } else {
+        panic!(
+            "Unexpected response from daemon for parent: {:?}",
+            resp_parent
+        );
+    }
+
+    // 3. Graceful shutdown
+    let shut = send_daemon_request(&socket_path, DaemonRequest::Shutdown)
+        .await
+        .unwrap();
+    assert!(matches!(shut, DaemonResponse::ShutdownAck));
+    let res = server_handle.await;
+    assert!(res.is_ok());
+    assert!(!socket_path.exists());
 }

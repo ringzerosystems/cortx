@@ -51,6 +51,12 @@ pub const DEFAULT_AGY_END_LINE: usize = 800;
 /// Note: first-party tool schema; not published on vendor website as of 2026-10-23; applied as a secondary cap.
 pub const DEFAULT_AGY_BYTE_LIMIT: u64 = 46_080;
 
+/// Default 1-indexed starting line for OpenCode read invocations.
+pub const DEFAULT_OPENCODE_OFFSET: usize = 1;
+
+/// Default line count limit for OpenCode read invocations when omitted.
+pub const DEFAULT_OPENCODE_LIMIT: usize = 2000;
+
 /// Maximum number of lines in a bounded read to qualify as a [`ReadKind::Micro`] read.
 pub const MICRO_READ_MAX_LINES: usize = 150;
 
@@ -75,6 +81,31 @@ impl fmt::Display for ReadKind {
     }
 }
 
+/// Classification of agent read operations into advisory delivery tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadCoverage {
+    /// Bounded read with effective line count <= 150 lines.
+    #[serde(alias = "Micro")]
+    Micro,
+    /// Whole-file read where lines 1..=total_lines and all bytes were ingested without truncation.
+    #[serde(alias = "FullFile", alias = "full_file")]
+    FullFile,
+    /// Broad read (> 150 lines) covering a subset of the file, or truncated by a vendor cap.
+    #[serde(alias = "PartialMacro", alias = "partial_macro")]
+    PartialMacro,
+}
+
+impl fmt::Display for ReadCoverage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Micro => write!(f, "micro"),
+            Self::FullFile => write!(f, "full_file"),
+            Self::PartialMacro => write!(f, "partial_macro"),
+        }
+    }
+}
+
 /// AI coding agent vendor identity used to apply default read window bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,7 +114,12 @@ pub enum AgentVendor {
     Claude,
     /// Google Antigravity (`read_file` tool: defaults to lines 1..=800, capped at 46,080 bytes).
     Agy,
+    /// OpenCode tool invocation (`read` tool: defaults to lines 1..=2000).
+    #[value(name = "opencode")]
+    #[serde(rename = "opencode", alias = "open_code", alias = "OpenCode")]
+    OpenCode,
     /// Generic or unattributed tool invocation.
+    #[serde(other)]
     Generic,
 }
 
@@ -92,7 +128,22 @@ impl fmt::Display for AgentVendor {
         match self {
             Self::Claude => write!(f, "claude"),
             Self::Agy => write!(f, "agy"),
+            Self::OpenCode => write!(f, "opencode"),
             Self::Generic => write!(f, "generic"),
+        }
+    }
+}
+
+impl std::str::FromStr for AgentVendor {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let normalized = s.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "claude" => Ok(Self::Claude),
+            "agy" | "antigravity" => Ok(Self::Agy),
+            "opencode" | "open_code" | "open-code" => Ok(Self::OpenCode),
+            _ => Ok(Self::Generic),
         }
     }
 }
@@ -167,6 +218,7 @@ impl ReadSpan {
             match self.vendor {
                 Some(AgentVendor::Claude) => DEFAULT_CLAUDE_OFFSET,
                 Some(AgentVendor::Agy) => DEFAULT_AGY_START_LINE,
+                Some(AgentVendor::OpenCode) => DEFAULT_OPENCODE_OFFSET,
                 Some(AgentVendor::Generic) | None => 1,
             }
         };
@@ -191,10 +243,36 @@ impl ReadSpan {
                 Some(AgentVendor::Agy) => {
                     start.saturating_add(DEFAULT_AGY_END_LINE.saturating_sub(1))
                 }
+                Some(AgentVendor::OpenCode) => {
+                    start.saturating_add(DEFAULT_OPENCODE_LIMIT.saturating_sub(1))
+                }
             }
         };
 
         (start, end)
+    }
+
+    /// Returns the effective line count of this read span if computable.
+    #[must_use]
+    pub fn effective_line_count(&self, total_lines: Option<usize>) -> Option<usize> {
+        if let Some(total) = total_lines {
+            if total == 0 {
+                return Some(0);
+            }
+            let (start, end) = self.effective_range(total);
+            if start == 0 {
+                return Some(0);
+            }
+            Some(end.saturating_sub(start).saturating_add(1))
+        } else if let Some(limit) = self.limit {
+            Some(limit)
+        } else if let (Some(start), Some(end)) = (self.start_line, self.end_line) {
+            let s = if start == 0 { 1 } else { start };
+            let e = if end < s { s } else { end };
+            Some(e.saturating_sub(s).saturating_add(1))
+        } else {
+            None
+        }
     }
 
     /// Resolves the effective 1-indexed inclusive `(start_line, end_line)` clamped to `total_lines`.
@@ -376,10 +454,15 @@ fn parse_tool_input_envelope(
 
     let file_path = extract_path(tool_input).or_else(|| extract_path(root));
     let mut span = extract_span_fields(tool_input);
+    let is_opencode_tool = tool_input.contains_key("filePath")
+        && !tool_input.contains_key("file_path")
+        && !is_agy_tool;
     span.vendor = extract_explicit_vendor(tool_input)
         .or_else(|| extract_explicit_vendor(root))
         .or(Some(if is_agy_tool {
             AgentVendor::Agy
+        } else if is_opencode_tool {
+            AgentVendor::OpenCode
         } else {
             AgentVendor::Claude
         }));
@@ -402,7 +485,16 @@ fn parse_flat_object(obj: &serde_json::Map<String, Value>) -> Option<ParsedHookI
         .and_then(Value::as_str);
 
     let inferred_vendor = extract_explicit_vendor(obj).or_else(|| {
-        if let Some(name) = tool_name {
+        if obj.contains_key("AbsolutePath")
+            || obj.contains_key("Path")
+            || obj.contains_key("StartLine")
+            || obj.contains_key("EndLine")
+            || obj.contains_key("ByteOffset")
+        {
+            Some(AgentVendor::Agy)
+        } else if obj.contains_key("filePath") && !obj.contains_key("file_path") {
+            Some(AgentVendor::OpenCode)
+        } else if let Some(name) = tool_name {
             if name.eq_ignore_ascii_case("read") {
                 return Some(AgentVendor::Claude);
             }
@@ -413,14 +505,7 @@ fn parse_flat_object(obj: &serde_json::Map<String, Value>) -> Option<ParsedHookI
             {
                 return Some(AgentVendor::Agy);
             }
-        }
-        if obj.contains_key("AbsolutePath")
-            || obj.contains_key("Path")
-            || obj.contains_key("StartLine")
-            || obj.contains_key("EndLine")
-            || obj.contains_key("ByteOffset")
-        {
-            Some(AgentVendor::Agy)
+            None
         } else if obj.contains_key("offset")
             || obj.contains_key("limit")
             || obj.contains_key("file_path")
@@ -495,6 +580,8 @@ fn extract_explicit_vendor(map: &serde_json::Map<String, Value>) -> Option<Agent
         Some(AgentVendor::Claude)
     } else if raw.eq_ignore_ascii_case("agy") || raw.eq_ignore_ascii_case("antigravity") {
         Some(AgentVendor::Agy)
+    } else if raw.eq_ignore_ascii_case("opencode") || raw.eq_ignore_ascii_case("open_code") {
+        Some(AgentVendor::OpenCode)
     } else if raw.eq_ignore_ascii_case("generic") {
         Some(AgentVendor::Generic)
     } else {
@@ -523,6 +610,16 @@ pub struct ReadBudgetEnv {
     pub claude_max_read_tokens: Option<u64>,
 }
 
+impl ReadBudgetEnv {
+    /// Returns the maximum allowed read bytes for Claude Code based on the token cap.
+    #[must_use]
+    pub fn claude_max_bytes(&self) -> u64 {
+        self.claude_max_read_tokens
+            .unwrap_or(DEFAULT_CLAUDE_MAX_READ_TOKENS)
+            .saturating_mul(EST_BYTES_PER_TOKEN)
+    }
+}
+
 /// Detects [`ReadBudgetEnv`] from process environment variables using a closure.
 #[must_use]
 pub fn detect_budget_env(get: impl Fn(&str) -> Option<String>) -> ReadBudgetEnv {
@@ -539,6 +636,21 @@ pub fn detect_budget_env(get: impl Fn(&str) -> Option<String>) -> ReadBudgetEnv 
             .is_some_and(|s| !s.is_empty())
     {
         Some(AgentVendor::Agy)
+    } else if get("OPENCODE")
+        .as_deref()
+        .is_some_and(|s| s == "1" || (!s.is_empty() && s != "0"))
+        || get("OPENCODE_AGENT").as_deref() == Some("1")
+        || get("OPENCODE_SESSION_ID")
+            .as_deref()
+            .is_some_and(|s| !s.is_empty() && s != "0")
+        || get("OPENCODE_PID")
+            .as_deref()
+            .is_some_and(|s| !s.is_empty() && s != "0")
+        || get("OPENCODE_CLIENT")
+            .as_deref()
+            .is_some_and(|s| !s.is_empty() && s != "0")
+    {
+        Some(AgentVendor::OpenCode)
     } else {
         None
     };
@@ -568,10 +680,7 @@ fn claude_budget(span: &ReadSpan, content: &str, env: &ReadBudgetEnv) -> u64 {
         };
     }
 
-    let claude_max_tokens = env
-        .claude_max_read_tokens
-        .unwrap_or(DEFAULT_CLAUDE_MAX_READ_TOKENS);
-    let token_byte_cap = claude_max_tokens.saturating_mul(EST_BYTES_PER_TOKEN);
+    let token_byte_cap = env.claude_max_bytes();
 
     if !has_bounds {
         let mut claude_span = span.clone();
@@ -596,6 +705,7 @@ fn claude_budget(span: &ReadSpan, content: &str, env: &ReadBudgetEnv) -> u64 {
 /// Implements vendor-specific defaults and caps:
 /// - **Claude**: 25,000 tokens (or override), auto-paginated up to token cap for unbounded reads.
 /// - **Antigravity**: 800 lines default, 46,080 byte maximum cap.
+/// - **OpenCode**: 2,000 lines default.
 /// - **Generic**: Full file size (or explicit line window).
 #[must_use]
 pub fn resolve_read_budget(span: &ReadSpan, content: &str, env: &ReadBudgetEnv) -> u64 {
@@ -614,11 +724,76 @@ pub fn resolve_read_budget(span: &ReadSpan, content: &str, env: &ReadBudgetEnv) 
             agy_span.vendor = Some(AgentVendor::Agy);
             agy_span.calculate_read_bytes(content)
         }
+        AgentVendor::OpenCode => {
+            let mut opencode_span = span.clone();
+            opencode_span.vendor = Some(AgentVendor::OpenCode);
+            opencode_span.calculate_read_bytes(content)
+        }
         AgentVendor::Generic => {
             let mut gen_span = span.clone();
             gen_span.vendor = Some(AgentVendor::Generic);
             gen_span.calculate_read_bytes(content)
         }
+    }
+}
+
+/// Classifies an agent read operation into one of three advisory delivery tiers:
+/// [`ReadCoverage::Micro`], [`ReadCoverage::FullFile`], or [`ReadCoverage::PartialMacro`].
+#[must_use]
+pub fn classify_read_coverage(
+    span: &ReadSpan,
+    total_lines: Option<usize>,
+    raw_bytes: Option<u64>,
+    env: &ReadBudgetEnv,
+) -> ReadCoverage {
+    let vendor = span
+        .vendor
+        .or(env.env_vendor)
+        .unwrap_or(AgentVendor::Generic);
+
+    if let Some(tot) = total_lines {
+        if tot == 0 {
+            return ReadCoverage::FullFile;
+        }
+
+        let (start, end) = span.effective_range(tot);
+        let covers_all_lines = start <= 1 && end >= tot;
+
+        if covers_all_lines {
+            let is_truncated = match vendor {
+                AgentVendor::Claude => {
+                    span.allow_large != Some(true)
+                        && raw_bytes.is_some_and(|b| b > env.claude_max_bytes())
+                }
+                AgentVendor::Agy => raw_bytes.is_some_and(|b| b > DEFAULT_AGY_BYTE_LIMIT),
+                AgentVendor::OpenCode | AgentVendor::Generic => false,
+            };
+
+            if !is_truncated {
+                return ReadCoverage::FullFile;
+            }
+        }
+
+        let has_explicit_bounds = span.offset.is_some()
+            || span.limit.is_some()
+            || span.start_line.is_some()
+            || span.end_line.is_some();
+
+        if has_explicit_bounds && start > 0 {
+            let lines_read = end.saturating_sub(start).saturating_add(1);
+            if lines_read <= MICRO_READ_MAX_LINES {
+                return ReadCoverage::Micro;
+            }
+        }
+
+        ReadCoverage::PartialMacro
+    } else {
+        if let Some(lines) = span.effective_line_count(None) {
+            if lines <= MICRO_READ_MAX_LINES {
+                return ReadCoverage::Micro;
+            }
+        }
+        ReadCoverage::PartialMacro
     }
 }
 
@@ -1131,5 +1306,239 @@ mod tests {
 
         let de_micro_alias: ReadKind = serde_json::from_str("\"Micro\"").unwrap();
         assert_eq!(de_micro_alias, ReadKind::Micro);
+    }
+
+    #[test]
+    fn opencode_defaults_read_to_2000_lines() {
+        let span = ReadSpan {
+            vendor: Some(AgentVendor::OpenCode),
+            ..Default::default()
+        };
+        assert_eq!(span.effective_range(3000), (1, 2000));
+        assert_eq!(span.effective_range(1500), (1, 1500));
+        assert_eq!(span.effective_range(0), (0, 0));
+    }
+
+    #[test]
+    fn parse_opencode_stdin_json() {
+        let json_envelope = r#"{
+            "tool_name": "read",
+            "tool_input": {
+                "filePath": "/workspace/src/lib.rs",
+                "offset": 100,
+                "limit": 50
+            }
+        }"#;
+        let parsed = parse_hook_stdin(json_envelope).expect("parse opencode envelope");
+        assert_eq!(
+            parsed.file_path,
+            Some(PathBuf::from("/workspace/src/lib.rs"))
+        );
+        assert_eq!(parsed.span.vendor, Some(AgentVendor::OpenCode));
+        assert_eq!(parsed.span.offset, Some(100));
+        assert_eq!(parsed.span.limit, Some(50));
+        assert_eq!(parsed.span.effective_range(500), (100, 149));
+
+        let json_flat = r#"{
+            "filePath": "/workspace/src/main.rs",
+            "offset": 1,
+            "limit": 2000
+        }"#;
+        let parsed_flat = parse_hook_stdin(json_flat).expect("parse opencode flat");
+        assert_eq!(parsed_flat.span.vendor, Some(AgentVendor::OpenCode));
+        assert_eq!(
+            parsed_flat.file_path,
+            Some(PathBuf::from("/workspace/src/main.rs"))
+        );
+
+        let json_explicit = r#"{
+            "vendor": "opencode",
+            "file_path": "/workspace/src/app.rs"
+        }"#;
+        let parsed_exp = parse_hook_stdin(json_explicit).expect("parse opencode explicit vendor");
+        assert_eq!(parsed_exp.span.vendor, Some(AgentVendor::OpenCode));
+    }
+
+    #[test]
+    fn test_detect_budget_env_opencode() {
+        for (var, val) in [
+            ("OPENCODE", "1"),
+            ("OPENCODE_AGENT", "1"),
+            ("OPENCODE_SESSION_ID", "sess-1234"),
+            ("OPENCODE_PID", "9876"),
+            ("OPENCODE_CLIENT", "desktop"),
+        ] {
+            let env = detect_budget_env(|k| {
+                if k == var {
+                    Some(val.to_string())
+                } else {
+                    None
+                }
+            });
+            assert_eq!(
+                env.env_vendor,
+                Some(AgentVendor::OpenCode),
+                "failed for {var}"
+            );
+        }
+
+        let env_zero = detect_budget_env(|k| {
+            if k == "OPENCODE" {
+                Some("0".to_string())
+            } else {
+                None
+            }
+        });
+        assert_eq!(env_zero.env_vendor, None);
+
+        let env_empty = detect_budget_env(|k| {
+            if k == "OPENCODE_SESSION_ID" {
+                Some(String::new())
+            } else {
+                None
+            }
+        });
+        assert_eq!(env_empty.env_vendor, None);
+    }
+
+    #[test]
+    fn test_classify_read_coverage_opencode() {
+        let env = ReadBudgetEnv::default();
+        let unbounded = ReadSpan {
+            vendor: Some(AgentVendor::OpenCode),
+            ..Default::default()
+        };
+
+        // OpenCode on 1500-line file covers whole file (1500 <= 2000) -> FullFile
+        assert_eq!(
+            classify_read_coverage(&unbounded, Some(1500), None, &env),
+            ReadCoverage::FullFile
+        );
+
+        // OpenCode on 2500-line file caps at 2000 lines -> PartialMacro
+        assert_eq!(
+            classify_read_coverage(&unbounded, Some(2500), None, &env),
+            ReadCoverage::PartialMacro
+        );
+
+        // OpenCode bounded micro-read (50 lines) on 2500-line file -> Micro
+        let micro = ReadSpan {
+            offset: Some(10),
+            limit: Some(50),
+            vendor: Some(AgentVendor::OpenCode),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_read_coverage(&micro, Some(2500), None, &env),
+            ReadCoverage::Micro
+        );
+    }
+
+    #[test]
+    fn test_classify_read_coverage_micro_boundaries() {
+        let env = ReadBudgetEnv::default();
+
+        // Exactly 150 lines on 500-line file -> Micro
+        let span_150 = ReadSpan {
+            start_line: Some(1),
+            end_line: Some(150),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_read_coverage(&span_150, Some(500), None, &env),
+            ReadCoverage::Micro
+        );
+
+        // 151 lines on 500-line file -> PartialMacro
+        let span_151 = ReadSpan {
+            start_line: Some(1),
+            end_line: Some(151),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_read_coverage(&span_151, Some(500), None, &env),
+            ReadCoverage::PartialMacro
+        );
+
+        // 150 lines on 150-line file covers whole file -> FullFile
+        assert_eq!(
+            classify_read_coverage(&span_150, Some(150), None, &env),
+            ReadCoverage::FullFile
+        );
+
+        // 20 lines on 20-line file -> FullFile
+        let span_20 = ReadSpan {
+            start_line: Some(1),
+            end_line: Some(20),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_read_coverage(&span_20, Some(20), None, &env),
+            ReadCoverage::FullFile
+        );
+
+        // 0 lines -> FullFile
+        assert_eq!(
+            classify_read_coverage(&span_20, Some(0), None, &env),
+            ReadCoverage::FullFile
+        );
+    }
+
+    #[test]
+    fn test_claude_max_bytes_and_effective_line_count() {
+        let env_default = ReadBudgetEnv::default();
+        assert_eq!(env_default.claude_max_bytes(), 100_000);
+
+        let env_custom = ReadBudgetEnv {
+            claude_max_read_tokens: Some(10_000),
+            ..Default::default()
+        };
+        assert_eq!(env_custom.claude_max_bytes(), 40_000);
+
+        let span_bounded = ReadSpan {
+            offset: Some(10),
+            limit: Some(25),
+            ..Default::default()
+        };
+        assert_eq!(span_bounded.effective_line_count(Some(100)), Some(25));
+        assert_eq!(span_bounded.effective_line_count(None), Some(25));
+
+        let span_lines = ReadSpan {
+            start_line: Some(5),
+            end_line: Some(15),
+            ..Default::default()
+        };
+        assert_eq!(span_lines.effective_line_count(Some(100)), Some(11));
+        assert_eq!(span_lines.effective_line_count(None), Some(11));
+
+        let span_unbounded = ReadSpan::default();
+        assert_eq!(span_unbounded.effective_line_count(None), None);
+    }
+
+    #[test]
+    fn test_agent_vendor_serde_forward_compatibility() {
+        let opencode_json = "\"opencode\"";
+        let parsed: AgentVendor = serde_json::from_str(opencode_json).unwrap();
+        assert_eq!(parsed, AgentVendor::OpenCode);
+        assert_eq!(parsed.to_string(), "opencode");
+
+        let unknown_json = "\"cursor\"";
+        let parsed_unknown: AgentVendor = serde_json::from_str(unknown_json).unwrap();
+        assert_eq!(parsed_unknown, AgentVendor::Generic);
+
+        let parsed_from_str: AgentVendor = "opencode".parse().unwrap();
+        assert_eq!(parsed_from_str, AgentVendor::OpenCode);
+    }
+
+    #[test]
+    fn test_read_coverage_display_and_serde() {
+        assert_eq!(ReadCoverage::Micro.to_string(), "micro");
+        assert_eq!(ReadCoverage::FullFile.to_string(), "full_file");
+        assert_eq!(ReadCoverage::PartialMacro.to_string(), "partial_macro");
+
+        let json = serde_json::to_string(&ReadCoverage::FullFile).unwrap();
+        assert_eq!(json, "\"full_file\"");
+        let de: ReadCoverage = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, ReadCoverage::FullFile);
     }
 }

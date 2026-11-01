@@ -69,6 +69,18 @@ impl AcmeService for AcmeEngine {
     )
     .unwrap();
 
+    let caller_rs = project_dir.join("crates/core/caller.rs");
+    std::fs::write(
+        &caller_rs,
+        r#"use crate::lib::{AcmeEngine, AcmeService};
+
+pub fn run_acme_pipeline(engine: &AcmeEngine) -> bool {
+    engine.execute()
+}
+"#,
+    )
+    .unwrap();
+
     // Rust file outside `watch_paths = ["crates"]`
     std::fs::write(
         project_dir.join("unwatched_rust/extra.rs"),
@@ -222,8 +234,14 @@ lang = "go"
         .expect("failed to run post-read hook");
     assert!(hook_out.status.success());
     let hook_stdout = String::from_utf8_lossy(&hook_out.stdout);
+    assert!(hook_stdout.contains("<!-- cortx-context-provenance: daemon (socket:"));
     assert!(hook_stdout.contains("AcmeEngine"));
     assert!(hook_stdout.contains("AcmeService"));
+    assert!(hook_stdout.contains("## Upstream Callers"));
+    assert!(hook_stdout.contains("run_acme_pipeline"));
+    assert!(hook_stdout.contains("caller.rs"));
+    assert!(!hook_stdout.contains("## Type Skeleton"));
+    assert!(!hook_stdout.contains("Token Reduction"));
 
     // 7. Re-query status and verify project_name, config_path, and filtered file count
     let status_after_out = cortx_cmd(cortx_bin)
@@ -245,8 +263,9 @@ lang = "go"
     let ws = &status_after.workspaces[0];
     assert_eq!(ws.project_name.as_deref(), Some("acme-web"));
     assert_eq!(ws.config_path, Some(canonical_custom_toml));
-    // Only `crates/core/lib.rs` should be indexed (`unwatched_rust/`, `ignored_secret/`, and `.go` excluded)
-    assert_eq!(ws.indexed_files, 1);
+    // Only files under crates/ (`crates/core/lib.rs` and `crates/core/caller.rs`) should be indexed
+    // (`unwatched_rust/`, `ignored_secret/`, and `.go` excluded)
+    assert_eq!(ws.indexed_files, 2);
 
     // Verify human status table output includes PROJECT (`acme-web`) and CONFIG (`custom_daemon.toml`)
     let status_human_out = cortx_cmd(cortx_bin)

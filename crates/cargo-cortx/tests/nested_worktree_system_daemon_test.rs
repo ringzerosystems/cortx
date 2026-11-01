@@ -65,11 +65,16 @@ async fn test_nested_dot_worktrees_overlay_and_post_read_hook() {
     let repo = base_path.join("auth-service");
     let parent_lib = init_repo(
         &repo,
-        r#"pub struct ParentAuth {
+        r#"pub trait ParentAuthContract {
+    fn verify_parent(&self) -> bool;
+    fn audit_parent(&self) -> usize;
+}
+
+pub struct ParentAuth {
     pub id: u64,
 }
 
-impl ParentAuth {
+impl ParentAuthContract for ParentAuth {
     pub fn verify_parent(&self) -> bool {
         let mut check = true;
         for i in 0..100 {
@@ -109,11 +114,16 @@ impl ParentAuth {
     let wt_lib = wt_dir.join("src/lib.rs");
     std::fs::write(
         &wt_lib,
-        r#"pub struct WorktreeAuth {
+        r#"pub trait WorktreeAuthContract {
+    fn verify_worktree(&self) -> bool;
+    fn audit_worktree(&self) -> usize;
+}
+
+pub struct WorktreeAuth {
     pub token: String,
 }
 
-impl WorktreeAuth {
+impl WorktreeAuthContract for WorktreeAuth {
     pub fn verify_worktree(&self) -> bool {
         let mut valid = false;
         for ch in "worktree_auth_token_verification_payload_with_extended_validation_chain".chars() {
@@ -174,6 +184,9 @@ impl WorktreeAuth {
             end_line: None,
             raw_read_bytes: None,
             read_kind: None,
+            total_lines: None,
+            vendor: None,
+            is_full_read: None,
         },
     )
     .await
@@ -213,6 +226,9 @@ impl WorktreeAuth {
             end_line: None,
             raw_read_bytes: None,
             read_kind: None,
+            total_lines: None,
+            vendor: None,
+            is_full_read: None,
         },
     )
     .await
@@ -237,11 +253,16 @@ async fn test_nested_claude_worktree_with_ignored_dirs_and_live_watcher_routing(
     let repo = base_path.join("acme-web");
     let parent_lib = init_repo(
         &repo,
-        r#"pub struct ParentMain {
+        r#"pub trait ParentMainContract {
+    fn routine(&self) -> bool;
+    fn audit_parent(&self) -> usize;
+}
+
+pub struct ParentMain {
     pub v: u32,
 }
 
-impl ParentMain {
+impl ParentMainContract for ParentMain {
     pub fn routine(&self) -> bool {
         let mut sum = 0u64;
         for i in 0..100 {
@@ -279,11 +300,16 @@ impl ParentMain {
     let wt_lib = wt_dir.join("src/lib.rs");
     std::fs::write(
         &wt_lib,
-        r#"pub struct AgentFeatInitial {
+        r#"pub trait AgentFeatContract {
+    fn feat_step(&self) -> bool;
+    fn audit_feat(&self) -> usize;
+}
+
+pub struct AgentFeatInitial {
     pub ok: bool,
 }
 
-impl AgentFeatInitial {
+impl AgentFeatContract for AgentFeatInitial {
     pub fn feat_step(&self) -> bool {
         let mut check = false;
         for step in 0..100 {
@@ -371,6 +397,9 @@ ignored_dirs = [".claude"]
             end_line: None,
             raw_read_bytes: None,
             read_kind: None,
+            total_lines: None,
+            vendor: None,
+            is_full_read: None,
         },
     )
     .await
@@ -384,6 +413,9 @@ ignored_dirs = [".claude"]
             end_line: None,
             raw_read_bytes: None,
             read_kind: None,
+            total_lines: None,
+            vendor: None,
+            is_full_read: None,
         },
     )
     .await
@@ -416,22 +448,27 @@ ignored_dirs = [".claude"]
         .find(|w| w.root == canonical_wt)
         .unwrap();
     assert_eq!(wt_ws.project_name.as_deref(), Some("acme-web"));
-    // Only `src/lib.rs` (1 file, 1 symbol) inside the worktree should be indexed;
+    // Only `src/lib.rs` (1 file, 4 symbols: trait + struct + 2 methods) inside the worktree should be indexed;
     // `<worktree>/target/*` and `<worktree>/.claude/*` must be ignored.
     assert_eq!(wt_ws.indexed_files, 1);
-    assert_eq!(wt_ws.total_symbols, 1);
+    assert_eq!(wt_ws.total_symbols, 4);
     assert_eq!(parent_ws.indexed_files, 1);
-    assert_eq!(parent_ws.total_symbols, 1);
+    assert_eq!(parent_ws.total_symbols, 4);
 
     // 4. Perform live file edit inside `<repo>/.claude/worktrees/agent-feat/src/lib.rs`
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     std::fs::write(
         &wt_lib,
-        r#"pub struct AgentFeatInitial {
+        r#"pub trait AgentFeatContract {
+    fn feat_step(&self) -> bool;
+    fn audit_feat(&self) -> usize;
+}
+
+pub struct AgentFeatInitial {
     pub ok: bool,
 }
 
-impl AgentFeatInitial {
+impl AgentFeatContract for AgentFeatInitial {
     pub fn feat_step(&self) -> bool {
         let mut check = false;
         for step in 0..100 {
@@ -467,7 +504,7 @@ pub struct LiveEditedTwo {
     // Wait for watcher to log the mutation in the worktree's workspace log
     wait_for_log_substring(&wt_ws.log_path, "updated symbol index").await;
 
-    // Verify worktree index now has 3 symbols while parent repo index still has 1 symbol
+    // Verify worktree index now has 6 symbols while parent repo index still has 4 symbols
     let DaemonResponse::Status(status_after): DaemonResponse =
         send_daemon_request(&socket_path, DaemonRequest::Status)
             .await
@@ -486,12 +523,12 @@ pub struct LiveEditedTwo {
         .find(|w| w.root == canonical_wt)
         .unwrap();
     assert!(
-        wt_ws_after.total_symbols >= 3,
+        wt_ws_after.total_symbols >= 6,
         "Worktree index must be updated with new symbols by live file watcher (got {})",
         wt_ws_after.total_symbols
     );
     assert_eq!(
-        parent_ws_after.total_symbols, 1,
+        parent_ws_after.total_symbols, 4,
         "Parent repo index must not be polluted by worktree edit"
     );
     let parent_log = std::fs::read_to_string(&parent_ws.log_path).unwrap_or_default();
@@ -499,6 +536,246 @@ pub struct LiveEditedTwo {
         !parent_log.contains("updated symbol index"),
         "Parent workspace log must not record worktree file mutations"
     );
+
+    let _ = send_daemon_request(&socket_path, DaemonRequest::Shutdown).await;
+    let _ = handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_nested_worktree_overlay_union_and_deletion_tombstones() {
+    let base = tempdir().unwrap();
+    let base_path = std::fs::canonicalize(base.path()).unwrap();
+
+    let repo = base_path.join("overlay-repo");
+    let src = repo.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    run_git(&repo, &["init"]);
+    run_git(&repo, &["config", "user.email", "test@example.com"]);
+    run_git(&repo, &["config", "user.name", "Test User"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
+
+    let main_lib = src.join("lib.rs");
+    std::fs::write(
+        &main_lib,
+        r#"pub struct ServiceEngine {
+    pub capacity: usize,
+}
+
+impl ServiceEngine {
+    pub fn run_engine(&self) -> bool {
+        self.capacity > 0
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        src.join("caller_one.rs"),
+        r#"use crate::lib::ServiceEngine;
+
+pub fn base_caller_one(engine: &ServiceEngine) -> bool {
+    engine.run_engine()
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        src.join("caller_two.rs"),
+        r#"use crate::lib::ServiceEngine;
+
+pub fn base_caller_two(engine: &ServiceEngine) -> bool {
+    engine.run_engine()
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        src.join("deleted_caller.rs"),
+        r#"use crate::lib::ServiceEngine;
+
+pub fn soon_deleted_caller(engine: &ServiceEngine) -> bool {
+    engine.run_engine()
+}
+"#,
+    )
+    .unwrap();
+
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "initial commit"]);
+
+    // Create nested worktree at `<repo>/.worktrees/nested-overlay`
+    let wt_dir = repo.join(".worktrees/nested-overlay");
+    std::fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
+    run_git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "nested-overlay",
+            wt_dir.to_str().unwrap(),
+        ],
+    );
+
+    // In the nested worktree:
+    // 1. Modify `caller_one.rs` to have `wt_modified_caller`
+    std::fs::write(
+        wt_dir.join("src/caller_one.rs"),
+        r#"use crate::lib::ServiceEngine;
+
+pub fn wt_modified_caller(engine: &ServiceEngine) -> bool {
+    engine.run_engine()
+}
+"#,
+    )
+    .unwrap();
+
+    // 2. Delete `deleted_caller.rs`
+    std::fs::remove_file(wt_dir.join("src/deleted_caller.rs")).unwrap();
+
+    let wt_lib = wt_dir.join("src/lib.rs");
+
+    // Start system daemon
+    let socket_path = base_path.join("nested_overlay.sock");
+    let log_dir = base_path.join("logs");
+    let token = CancellationToken::new();
+    let s_sock = socket_path.clone();
+    let s_log = log_dir.clone();
+    let s_tok = token.clone();
+    let handle = tokio::spawn(async move {
+        let opts = ServerOptions {
+            socket_path: s_sock,
+            workspace_root: PathBuf::new(),
+            watcher_active: false,
+            log_dir: Some(s_log),
+            idle_ttl_secs: 7200,
+            daemon_config: CortxConfig::default(),
+            config_path: None,
+        };
+        run_server_with_options(opts, Arc::new(RwLock::new(SymbolIndex::new())), s_tok).await
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // 1. Query nested worktree file -> overlay ∪ (base \ shadowed_files)
+    let wt_resp = send_daemon_request(
+        &socket_path,
+        DaemonRequest::PostReadHook {
+            file: wt_lib.clone(),
+            start_line: None,
+            end_line: None,
+            raw_read_bytes: None,
+            read_kind: None,
+            total_lines: None,
+            vendor: None,
+            is_full_read: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    if let DaemonResponse::AdvisoryContext { advisory_block, .. } = wt_resp {
+        assert!(
+            advisory_block.contains("wt_modified_caller"),
+            "Expected wt_modified_caller in nested worktree advisory, got:\n{}",
+            advisory_block
+        );
+        assert!(
+            advisory_block.contains("base_caller_two"),
+            "Expected unmodified base_caller_two preserved from base index in nested worktree advisory, got:\n{}",
+            advisory_block
+        );
+        assert!(
+            !advisory_block.contains("base_caller_one"),
+            "Shadowed base_caller_one must be replaced by overlay in nested worktree advisory, got:\n{}",
+            advisory_block
+        );
+        assert!(
+            !advisory_block.contains("soon_deleted_caller"),
+            "Deleted file caller soon_deleted_caller must be suppressed by worktree tombstone, got:\n{}",
+            advisory_block
+        );
+    } else {
+        panic!(
+            "Expected AdvisoryContext for nested worktree: {:?}",
+            wt_resp
+        );
+    }
+
+    // 2. Query parent repo file -> parent repository index remains intact with all original callers
+    let parent_resp = send_daemon_request(
+        &socket_path,
+        DaemonRequest::PostReadHook {
+            file: main_lib.clone(),
+            start_line: None,
+            end_line: None,
+            raw_read_bytes: None,
+            read_kind: None,
+            total_lines: None,
+            vendor: None,
+            is_full_read: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    if let DaemonResponse::AdvisoryContext { advisory_block, .. } = parent_resp {
+        assert!(
+            advisory_block.contains("base_caller_one"),
+            "Parent repo must retain original base_caller_one, got:\n{}",
+            advisory_block
+        );
+        assert!(
+            advisory_block.contains("base_caller_two"),
+            "Parent repo must retain base_caller_two, got:\n{}",
+            advisory_block
+        );
+        assert!(
+            advisory_block.contains("soon_deleted_caller"),
+            "Parent repo must retain soon_deleted_caller, got:\n{}",
+            advisory_block
+        );
+        assert!(
+            !advisory_block.contains("wt_modified_caller"),
+            "Parent repo must not be contaminated with wt_modified_caller, got:\n{}",
+            advisory_block
+        );
+    } else {
+        panic!(
+            "Expected AdvisoryContext for parent repo: {:?}",
+            parent_resp
+        );
+    }
+
+    // 3. Verify workspace carve-out in status
+    let status_resp = send_daemon_request(&socket_path, DaemonRequest::Status)
+        .await
+        .unwrap();
+    let DaemonResponse::Status(status): DaemonResponse = status_resp else {
+        panic!("Expected Status response");
+    };
+    let canonical_repo = std::fs::canonicalize(&repo).unwrap();
+    let canonical_wt = std::fs::canonicalize(&wt_dir).unwrap();
+
+    let parent_summary = status
+        .workspaces
+        .iter()
+        .find(|w| w.root == canonical_repo)
+        .expect("parent registered");
+    let wt_summary = status
+        .workspaces
+        .iter()
+        .find(|w| w.root == canonical_wt)
+        .expect("nested worktree registered");
+
+    assert!(!parent_summary.is_worktree);
+    assert!(wt_summary.is_worktree);
+    assert_eq!(wt_summary.parent_repo, Some(canonical_repo));
+    assert_eq!(parent_summary.indexed_files, 4);
+    assert_eq!(wt_summary.indexed_files, 3);
 
     let _ = send_daemon_request(&socket_path, DaemonRequest::Shutdown).await;
     let _ = handle.await;

@@ -1,7 +1,8 @@
-//! End-to-end integration tests for Claude Code and Antigravity (AGY) post-read hook
+//! End-to-end integration tests for Claude Code, Antigravity (AGY), and OpenCode post-read hook
 //! line spans, vendor defaults, and daemon token-saving telemetry.
 
 use cargo_cortx::{DaemonArgs, compute_hook_read_metrics, resolve_hook_input};
+use cortx_core::ReadKind;
 use cortx_core::span::{AgentVendor, DEFAULT_AGY_BYTE_LIMIT, ReadBudgetEnv};
 use cortx_daemon::{
     DaemonRequest, DaemonResponse, DaemonStatusInfo, ServerOptions, run_server_with_options,
@@ -25,8 +26,10 @@ struct TestHarness {
     socket_path: PathBuf,
     sample_file: PathBuf,
     service_file: PathBuf,
+    dense_service_file: PathBuf,
     original_content: String,
     service_content: String,
+    dense_service_content: String,
     token: CancellationToken,
     server_handle: JoinHandle<()>,
 }
@@ -54,6 +57,28 @@ impl TestHarness {
             );
         }
         std::fs::write(src_dir.join("caller.rs"), &caller_buf).expect("write caller.rs");
+
+        // Dense service and caller fixtures for PartialMacro ranked testing
+        let dense_service_file = src_dir.join("dense_service.rs");
+        let mut dense_service_content = String::new();
+        for i in 1..=60 {
+            let _ = writeln!(
+                dense_service_content,
+                "pub fn dense_op_{i:02}() -> u64 {{\n    {i}\n}}\n"
+            );
+        }
+        std::fs::write(&dense_service_file, &dense_service_content)
+            .expect("write dense_service.rs");
+
+        let mut dense_caller_buf = String::from("use crate::dense_service::*;\n\n");
+        for i in 1..=40 {
+            let _ = writeln!(
+                dense_caller_buf,
+                "pub fn dense_caller_{i:02}() {{ let _ = dense_op_01(); }}"
+            );
+        }
+        std::fs::write(src_dir.join("dense_caller.rs"), &dense_caller_buf)
+            .expect("write dense_caller.rs");
 
         let socket_path = dir.path().join("daemon.sock");
         let log_dir = dir.path().join("logs");
@@ -93,8 +118,10 @@ impl TestHarness {
             socket_path,
             sample_file,
             service_file,
+            dense_service_file,
             original_content,
             service_content,
+            dense_service_content,
             token,
             server_handle,
         }
@@ -136,6 +163,17 @@ fn assert_file_unchanged(path: &Path, expected: &str) {
     );
 }
 
+fn assert_mtime_unchanged(path: &Path, before: std::time::SystemTime) {
+    let after = std::fs::metadata(path)
+        .expect("file metadata")
+        .modified()
+        .expect("modified time");
+    assert_eq!(
+        before, after,
+        "advisory post-read hook must keep source file mtime strictly untouched"
+    );
+}
+
 async fn assert_file_contains_eventually(path: &Path, expected: &str) {
     let start = std::time::Instant::now();
     while start.elapsed() < std::time::Duration::from_secs(3) {
@@ -160,6 +198,11 @@ async fn assert_file_contains_eventually(path: &Path, expected: &str) {
 #[tokio::test]
 async fn claude_micro_read_records_exact_distill_bytes() {
     let harness = TestHarness::start().await;
+    let mtime_before = std::fs::metadata(&harness.sample_file)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+
     let stdin_json = serde_json::json!({
         "hook_event_name": "PostToolUse",
         "tool_name": "Read",
@@ -192,7 +235,10 @@ async fn claude_micro_read_records_exact_distill_bytes() {
             start_line,
             end_line,
             raw_read_bytes,
-            read_kind: None,
+            read_kind: Some(ReadKind::Micro),
+            total_lines: Some(TOTAL_LINES),
+            vendor: Some(AgentVendor::Claude),
+            is_full_read: Some(false),
         },
     )
     .await
@@ -210,21 +256,20 @@ async fn claude_micro_read_records_exact_distill_bytes() {
     let status = harness.status().await;
     assert_eq!(status.hooks_served, 1);
     assert_eq!(status.raw_bytes_served, (30 * LINE_BYTE_LEN) as u64);
-    assert_eq!(status.delivered_bytes_served, status.raw_bytes_served);
-    assert_eq!(status.bytes_saved, 0);
+    assert_eq!(status.delivered_bytes_served, 0);
     assert_eq!(status.submissions, 0);
-    assert_eq!(status.callgraph_drops, 0);
-    assert_eq!(status.ast_drops, 1);
+    assert_eq!(status.micro_reads, 1);
+    assert!(status.omitted_micro_reads >= 1);
     assert_eq!(status.workspaces.len(), 1);
     assert_eq!(status.workspaces[0].submissions, 0);
-    assert_eq!(status.workspaces[0].callgraph_drops, 0);
-    assert_eq!(status.workspaces[0].ast_drops, 1);
+    assert!(status.workspaces[0].omitted_micro_reads >= 1);
     assert_file_contains_eventually(
         &status.main_log_path,
-        "PostReadHook dropped all advisory context: skeleton",
+        "[MICRO] PostReadHook skipped (micro-read)",
     )
     .await;
     assert_file_unchanged(&harness.sample_file, &harness.original_content);
+    assert_mtime_unchanged(&harness.sample_file, mtime_before);
 
     harness.shutdown().await;
 }
@@ -232,6 +277,11 @@ async fn claude_micro_read_records_exact_distill_bytes() {
 #[tokio::test]
 async fn claude_omitted_bounds_apply_eof_and_token_cap() {
     let harness = TestHarness::start().await;
+    let mtime_before = std::fs::metadata(&harness.sample_file)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+
     let stdin_json = serde_json::json!({
         "hook_event_name": "PostToolUse",
         "tool_name": "Read",
@@ -262,16 +312,20 @@ async fn claude_omitted_bounds_apply_eof_and_token_cap() {
             start_line,
             end_line,
             raw_read_bytes,
-            read_kind: None,
+            read_kind: Some(ReadKind::Macro),
+            total_lines: Some(TOTAL_LINES),
+            vendor: Some(AgentVendor::Claude),
+            is_full_read: Some(false),
         },
     )
     .await
     .expect("send PostReadHook");
     match resp {
         DaemonResponse::AdvisoryContext { advisory_block, .. } => {
+            // Full-file read of a standalone leaf file omits self-skeleton and suppresses bloat
             assert!(
-                !advisory_block.is_empty(),
-                "default 2000 lines should deliver non-empty skeleton bundle"
+                advisory_block.is_empty(),
+                "full-file read of leaf file should omit self-skeleton"
             );
         }
         other => panic!("unexpected response: {other:?}"),
@@ -279,15 +333,13 @@ async fn claude_omitted_bounds_apply_eof_and_token_cap() {
 
     let status = harness.status().await;
     assert_eq!(status.hooks_served, 1);
-    assert_eq!(status.submissions, 1);
-    assert_eq!(status.callgraph_drops, 0);
-    assert_eq!(status.ast_drops, 0);
+    assert_eq!(status.macro_reads, 1);
+    assert!(status.omitted_full_read_skeletons >= 1);
     assert_eq!(status.workspaces.len(), 1);
-    assert_eq!(status.workspaces[0].submissions, 1);
-    assert_eq!(status.workspaces[0].callgraph_drops, 0);
-    assert_eq!(status.workspaces[0].ast_drops, 0);
     assert_eq!(status.raw_bytes_served, 100_000);
+    assert_eq!(status.delivered_bytes_served, 0);
     assert_file_unchanged(&harness.sample_file, &harness.original_content);
+    assert_mtime_unchanged(&harness.sample_file, mtime_before);
 
     harness.shutdown().await;
 }
@@ -295,6 +347,11 @@ async fn claude_omitted_bounds_apply_eof_and_token_cap() {
 #[tokio::test]
 async fn agy_micro_read_records_exact_distill_bytes() {
     let harness = TestHarness::start().await;
+    let mtime_before = std::fs::metadata(&harness.sample_file)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+
     let stdin_json = serde_json::json!({
         "toolCall": {
             "name": "read_file",
@@ -330,7 +387,10 @@ async fn agy_micro_read_records_exact_distill_bytes() {
             start_line,
             end_line,
             raw_read_bytes,
-            read_kind: None,
+            read_kind: Some(ReadKind::Micro),
+            total_lines: Some(TOTAL_LINES),
+            vendor: Some(AgentVendor::Agy),
+            is_full_read: Some(false),
         },
     )
     .await
@@ -348,12 +408,13 @@ async fn agy_micro_read_records_exact_distill_bytes() {
     let status = harness.status().await;
     assert_eq!(status.hooks_served, 1);
     assert_eq!(status.raw_bytes_served, expected_bytes);
-    assert_eq!(status.delivered_bytes_served, expected_bytes);
-    assert_eq!(status.bytes_saved, 0);
+    assert_eq!(status.delivered_bytes_served, 0);
     assert_eq!(status.submissions, 0);
-    assert_eq!(status.callgraph_drops, 0);
-    assert_eq!(status.ast_drops, 1);
+    assert_eq!(status.micro_reads, 1);
+    assert!(status.omitted_micro_reads >= 1);
+    assert_eq!(status.workspaces[0].omitted_micro_reads, 1);
     assert_file_unchanged(&harness.sample_file, &harness.original_content);
+    assert_mtime_unchanged(&harness.sample_file, mtime_before);
 
     harness.shutdown().await;
 }
@@ -361,6 +422,11 @@ async fn agy_micro_read_records_exact_distill_bytes() {
 #[tokio::test]
 async fn agy_omitted_lines_apply_default_800_lines_and_46kb_cap() {
     let harness = TestHarness::start().await;
+    let mtime_before = std::fs::metadata(&harness.sample_file)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+
     let stdin_json = serde_json::json!({
         "toolCall": {
             "name": "read_file",
@@ -393,7 +459,10 @@ async fn agy_omitted_lines_apply_default_800_lines_and_46kb_cap() {
             start_line,
             end_line,
             raw_read_bytes,
-            read_kind: None,
+            read_kind: Some(ReadKind::Macro),
+            total_lines: Some(TOTAL_LINES),
+            vendor: Some(AgentVendor::Agy),
+            is_full_read: Some(false),
         },
     )
     .await
@@ -401,8 +470,39 @@ async fn agy_omitted_lines_apply_default_800_lines_and_46kb_cap() {
     match resp {
         DaemonResponse::AdvisoryContext { advisory_block, .. } => {
             assert!(
-                advisory_block.is_empty(),
-                "2500-fn skeleton (~67.5KB) exceeds 46KB cap and must be omitted"
+                !advisory_block.is_empty(),
+                "800-line AGY read of 2500-line file should deliver non-empty unread outline"
+            );
+            assert!(
+                advisory_block.chars().count() <= 9_200,
+                "delivered advisory must be within 9,200 char wire limit"
+            );
+            assert!(
+                advisory_block.contains("## Unread File Outline"),
+                "advisory must include unread outline header"
+            );
+            assert_eq!(
+                advisory_block.matches("```").count() % 2,
+                0,
+                "code fences must be balanced"
+            );
+            assert!(
+                !advisory_block.contains("Token Reduction"),
+                "advisory block must not contain 'Token Reduction'"
+            );
+            // Declarations outside 1..=800 should be present
+            assert!(
+                advisory_block.contains("item_0801"),
+                "unread outline should contain declarations past line 800"
+            );
+            // Declarations inside 1..=800 must NOT be repeated
+            assert!(
+                !advisory_block.contains("item_0001"),
+                "already-read declarations in lines 1..=800 must not be repeated"
+            );
+            assert!(
+                !advisory_block.contains("item_0800"),
+                "already-read declarations in lines 1..=800 must not be repeated"
             );
         }
         other => panic!("unexpected response: {other:?}"),
@@ -410,11 +510,13 @@ async fn agy_omitted_lines_apply_default_800_lines_and_46kb_cap() {
 
     let status = harness.status().await;
     assert_eq!(status.hooks_served, 1);
-    assert_eq!(status.submissions, 0);
-    assert_eq!(status.callgraph_drops, 0);
-    assert_eq!(status.ast_drops, 1);
+    assert_eq!(status.macro_reads, 1);
+    assert!(status.submissions >= 1);
     assert_eq!(status.raw_bytes_served, DEFAULT_AGY_BYTE_LIMIT);
+    assert!(status.delivered_bytes_served > 0);
+    assert!(status.delivered_bytes_served <= 9_200);
     assert_file_unchanged(&harness.sample_file, &harness.original_content);
+    assert_mtime_unchanged(&harness.sample_file, mtime_before);
 
     harness.shutdown().await;
 }
@@ -422,6 +524,10 @@ async fn agy_omitted_lines_apply_default_800_lines_and_46kb_cap() {
 #[tokio::test]
 async fn legacy_post_read_hook_without_line_info_falls_back_to_file_size() {
     let harness = TestHarness::start().await;
+    let mtime_before = std::fs::metadata(&harness.sample_file)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
 
     let legacy_json = serde_json::json!({
         "PostReadHook": {
@@ -439,269 +545,117 @@ async fn legacy_post_read_hook_without_line_info_falls_back_to_file_size() {
 
     let status = harness.status().await;
     assert_eq!(status.hooks_served, 1);
-    assert_eq!(status.submissions, 1);
-    assert_eq!(status.callgraph_drops, 0);
-    assert_eq!(status.ast_drops, 0);
+    assert_eq!(status.macro_reads, 1);
     assert_eq!(
         status.raw_bytes_served,
         (TOTAL_LINES * LINE_BYTE_LEN) as u64
     );
     assert_file_unchanged(&harness.sample_file, &harness.original_content);
+    assert_mtime_unchanged(&harness.sample_file, mtime_before);
 
     harness.shutdown().await;
 }
 
 #[tokio::test]
-async fn two_stage_adaptive_bloat_guard_stages() {
+async fn three_tier_coverage_micro_drops_advisory() {
     let harness = TestHarness::start().await;
+    let mtime_before = std::fs::metadata(&harness.service_file)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
 
-    // --- Stage 1: Call graph pruning when bundle exceeds raw read but skeleton fits ---
-    // Full bundle has 12 callers (~950 bytes), skeleton alone is ~175 bytes.
-    // Reading 350 bytes triggers Stage 1 (pruning callers, keeping skeleton).
-    let resp1 = send_daemon_request(
-        &harness.socket_path,
-        DaemonRequest::PostReadHook {
-            file: harness.service_file.clone(),
-            start_line: Some(1),
-            end_line: Some(5),
-            raw_read_bytes: Some(350),
-            read_kind: None,
-        },
-    )
-    .await
-    .expect("send PostReadHook for Stage 1");
-
-    match resp1 {
-        DaemonResponse::AdvisoryContext { advisory_block, .. } => {
-            assert!(
-                !advisory_block.is_empty(),
-                "Stage 1 should deliver skeleton"
-            );
-            assert!(
-                advisory_block.contains("target_task"),
-                "skeleton should contain target_task signature"
-            );
-            assert!(
-                !advisory_block.contains("## Upstream Callers"),
-                "call graph should be stripped in Stage 1"
-            );
-            assert!(
-                !advisory_block.contains("caller_01"),
-                "individual caller edges should not appear in Stage 1"
-            );
-        }
-        other => panic!("unexpected response: {other:?}"),
-    }
-
-    let status1 = harness.status().await;
-    assert_eq!(status1.hooks_served, 1);
-    assert_eq!(status1.submissions, 1);
-    assert_eq!(status1.callgraph_drops, 1);
-    assert_eq!(status1.ast_drops, 0);
-    assert_eq!(status1.workspaces.len(), 1);
-    assert_eq!(status1.workspaces[0].submissions, 1);
-    assert_eq!(status1.workspaces[0].callgraph_drops, 1);
-    assert_eq!(status1.workspaces[0].ast_drops, 0);
-    assert_file_contains_eventually(
-        &status1.main_log_path,
-        "PostReadHook pruned call graph: bundle",
-    )
-    .await;
-
-    // --- Stage 2: Complete AST omission when micro-read is smaller than skeleton ---
-    // Reading 30 bytes (< skeleton ~175 bytes) triggers Stage 2 (omission).
-    let resp2 = send_daemon_request(
-        &harness.socket_path,
-        DaemonRequest::PostReadHook {
-            file: harness.service_file.clone(),
-            start_line: Some(1),
-            end_line: Some(2),
-            raw_read_bytes: Some(30),
-            read_kind: None,
-        },
-    )
-    .await
-    .expect("send PostReadHook for Stage 2");
-
-    match resp2 {
-        DaemonResponse::AdvisoryContext { advisory_block, .. } => {
-            assert!(
-                advisory_block.is_empty(),
-                "Stage 2 micro-read should omit all advisory context"
-            );
-        }
-        other => panic!("unexpected response: {other:?}"),
-    }
-
-    let status2 = harness.status().await;
-    assert_eq!(status2.hooks_served, 2);
-    assert_eq!(status2.submissions, 1);
-    assert_eq!(status2.callgraph_drops, 1);
-    assert_eq!(status2.ast_drops, 1);
-    assert_eq!(status2.workspaces[0].submissions, 1);
-    assert_eq!(status2.workspaces[0].callgraph_drops, 1);
-    assert_eq!(status2.workspaces[0].ast_drops, 1);
-    assert_file_contains_eventually(
-        &status2.main_log_path,
-        "PostReadHook dropped all advisory context: skeleton",
-    )
-    .await;
-
-    // --- Stage 0: Full bundle delivery when raw read accommodates complete bundle ---
-    // Reading 3000 bytes (> full bundle ~950 bytes) triggers Stage 0 (full delivery).
-    let resp3 = send_daemon_request(
+    // Micro-read (<= 150 lines bounded): lines 1..=50
+    let resp = send_daemon_request(
         &harness.socket_path,
         DaemonRequest::PostReadHook {
             file: harness.service_file.clone(),
             start_line: Some(1),
             end_line: Some(50),
-            raw_read_bytes: Some(3000),
-            read_kind: None,
+            raw_read_bytes: Some(500),
+            read_kind: Some(ReadKind::Micro),
+            total_lines: Some(1000),
+            vendor: Some(AgentVendor::Generic),
+            is_full_read: Some(false),
         },
     )
     .await
-    .expect("send PostReadHook for Stage 0");
+    .expect("send PostReadHook for Micro");
 
-    match resp3 {
+    match resp {
         DaemonResponse::AdvisoryContext { advisory_block, .. } => {
             assert!(
-                !advisory_block.is_empty(),
-                "Stage 0 should deliver full bundle"
-            );
-            assert!(
-                advisory_block.contains("target_task"),
-                "should contain target_task signature"
-            );
-            assert!(
-                advisory_block.contains("## Upstream Callers"),
-                "full bundle in Stage 0 should include callers"
-            );
-            assert!(
-                advisory_block.contains("caller_01"),
-                "should include individual caller edges"
+                advisory_block.is_empty(),
+                "micro-read tier must return empty string"
             );
         }
         other => panic!("unexpected response: {other:?}"),
     }
 
-    let status3 = harness.status().await;
-    assert_eq!(status3.hooks_served, 3);
-    assert_eq!(status3.submissions, 2);
-    assert_eq!(status3.callgraph_drops, 1);
-    assert_eq!(status3.ast_drops, 1);
-    assert_eq!(status3.workspaces[0].submissions, 2);
-    assert_eq!(status3.workspaces[0].callgraph_drops, 1);
-    assert_eq!(status3.workspaces[0].ast_drops, 1);
-
-    // Target files on disk must remain 100% byte-identical
+    let status = harness.status().await;
+    assert_eq!(status.hooks_served, 1);
+    assert_eq!(status.micro_reads, 1);
+    assert_eq!(status.delivered_bytes_served, 0);
+    assert!(status.omitted_micro_reads >= 1);
     assert_file_unchanged(&harness.service_file, &harness.service_content);
+    assert_mtime_unchanged(&harness.service_file, mtime_before);
 
     harness.shutdown().await;
 }
 
 #[tokio::test]
-async fn test_explicit_zero_byte_budget_drops_advisory() {
+async fn three_tier_coverage_full_file_delivers_cross_file_callers_without_skeleton() {
     let harness = TestHarness::start().await;
+    let mtime_before = std::fs::metadata(&harness.service_file)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
 
+    // Full-file read of service.rs (3 lines) which has 12 callers in caller.rs
     let resp = send_daemon_request(
         &harness.socket_path,
         DaemonRequest::PostReadHook {
             file: harness.service_file.clone(),
-            start_line: None,
-            end_line: None,
-            raw_read_bytes: Some(0),
-            read_kind: None,
-        },
-    )
-    .await
-    .expect("send PostReadHook with 0 budget");
-
-    match resp {
-        DaemonResponse::AdvisoryContext { advisory_block, .. } => {
-            assert!(
-                advisory_block.is_empty(),
-                "0-byte budget must drop advisory context completely"
-            );
-        }
-        other => panic!("unexpected response: {other:?}"),
-    }
-
-    let status = harness.status().await;
-    assert_eq!(status.hooks_served, 1);
-    assert_eq!(status.submissions, 0);
-    assert_eq!(status.callgraph_drops, 0);
-    assert_eq!(status.ast_drops, 1);
-
-    harness.shutdown().await;
-}
-
-#[tokio::test]
-async fn test_legacy_none_budget_on_tiny_file_drops_advisory() {
-    let harness = TestHarness::start().await;
-    let tiny_file = harness._dir.path().join("src/tiny.rs");
-    std::fs::write(&tiny_file, "pub fn t() {}\n").expect("write tiny.rs");
-
-    let resp = send_daemon_request(
-        &harness.socket_path,
-        DaemonRequest::PostReadHook {
-            file: tiny_file,
-            start_line: None,
-            end_line: None,
-            raw_read_bytes: None,
-            read_kind: None,
-        },
-    )
-    .await
-    .expect("send PostReadHook with legacy None budget");
-
-    match resp {
-        DaemonResponse::AdvisoryContext { advisory_block, .. } => {
-            assert!(
-                advisory_block.is_empty(),
-                "legacy None budget on tiny file must fall back to file size and drop advisory"
-            );
-        }
-        other => panic!("unexpected response: {other:?}"),
-    }
-
-    let status = harness.status().await;
-    assert_eq!(status.hooks_served, 1);
-    assert_eq!(status.submissions, 0);
-    assert_eq!(status.callgraph_drops, 0);
-    assert_eq!(status.ast_drops, 1);
-
-    harness.shutdown().await;
-}
-
-#[tokio::test]
-async fn test_no_call_graph_oversized_bundle_drops_not_prunes() {
-    let harness = TestHarness::start().await;
-    let standalone_file = harness._dir.path().join("src/standalone.rs");
-    std::fs::write(
-        &standalone_file,
-        "pub struct Standalone;\nimpl Standalone { pub fn op(&self) {} }\n",
-    )
-    .expect("write standalone.rs");
-
-    // Reading only 10 bytes: smaller than skeleton, and file has no call graph
-    let resp = send_daemon_request(
-        &harness.socket_path,
-        DaemonRequest::PostReadHook {
-            file: standalone_file,
             start_line: Some(1),
-            end_line: Some(2),
-            raw_read_bytes: Some(10),
-            read_kind: None,
+            end_line: Some(3),
+            raw_read_bytes: Some(harness.service_content.len() as u64),
+            read_kind: Some(ReadKind::Macro),
+            total_lines: Some(3),
+            vendor: Some(AgentVendor::Generic),
+            is_full_read: Some(true),
         },
     )
     .await
-    .expect("send PostReadHook for no-callgraph oversized bundle");
+    .expect("send PostReadHook for FullFile");
 
     match resp {
         DaemonResponse::AdvisoryContext { advisory_block, .. } => {
             assert!(
-                advisory_block.is_empty(),
-                "oversized bundle with no call graph must drop without pruning"
+                !advisory_block.is_empty(),
+                "full-file read with callers must deliver non-empty advisory"
+            );
+            assert!(
+                advisory_block.contains("## Upstream Callers"),
+                "full-file advisory must deliver upstream callers"
+            );
+            assert!(
+                advisory_block.contains("caller.rs:"),
+                "upstream callers must reference file and line location"
+            );
+            assert!(
+                advisory_block.contains("caller_01"),
+                "upstream callers must include caller functions"
+            );
+            assert!(
+                !advisory_block.contains("## Type Skeleton"),
+                "full-file advisory must omit target file skeleton"
+            );
+            assert!(
+                !advisory_block.contains("pub fn target_task"),
+                "full-file advisory must omit target function definition"
+            );
+            assert!(
+                !advisory_block.contains("Token Reduction"),
+                "full-file advisory must omit 'Token Reduction'"
             );
         }
         other => panic!("unexpected response: {other:?}"),
@@ -709,9 +663,359 @@ async fn test_no_call_graph_oversized_bundle_drops_not_prunes() {
 
     let status = harness.status().await;
     assert_eq!(status.hooks_served, 1);
-    assert_eq!(status.submissions, 0);
-    assert_eq!(status.callgraph_drops, 0);
-    assert_eq!(status.ast_drops, 1);
+    assert_eq!(status.macro_reads, 1);
+    assert!(status.submissions >= 1);
+    assert!(status.omitted_full_read_skeletons >= 1);
+    assert!(status.delivered_bytes_served > 0);
+    assert_file_unchanged(&harness.service_file, &harness.service_content);
+    assert_mtime_unchanged(&harness.service_file, mtime_before);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn three_tier_coverage_partial_macro_delivers_ranked_callers_and_unread_outline() {
+    let harness = TestHarness::start().await;
+    let mtime_before = std::fs::metadata(&harness.dense_service_file)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+
+    // Partial macro read (> 150 lines on a 240-line file with 40 callers)
+    // Reading lines 1..=160
+    let resp = send_daemon_request(
+        &harness.socket_path,
+        DaemonRequest::PostReadHook {
+            file: harness.dense_service_file.clone(),
+            start_line: Some(1),
+            end_line: Some(160),
+            raw_read_bytes: Some(160 * 30),
+            read_kind: Some(ReadKind::Macro),
+            total_lines: Some(240),
+            vendor: Some(AgentVendor::Generic),
+            is_full_read: Some(false),
+        },
+    )
+    .await
+    .expect("send PostReadHook for PartialMacro");
+
+    match resp {
+        DaemonResponse::AdvisoryContext { advisory_block, .. } => {
+            assert!(
+                !advisory_block.is_empty(),
+                "partial macro read must deliver non-empty advisory"
+            );
+            assert!(
+                advisory_block.chars().count() <= 9_200,
+                "advisory block must be bounded within 9,200 char wire limit"
+            );
+            assert_eq!(
+                advisory_block.matches("```").count() % 2,
+                0,
+                "code fences must be balanced"
+            );
+            assert!(
+                advisory_block.contains("## Upstream Callers"),
+                "advisory must deliver proximity-ranked upstream callers"
+            );
+            assert!(
+                advisory_block.contains("callers omitted"),
+                "dense callers (>32) must emit omitted caller suffix"
+            );
+            assert!(
+                advisory_block.contains("## Unread File Outline"),
+                "partial macro must deliver unread file outline"
+            );
+            let outline_part = advisory_block
+                .split("## Unread File Outline")
+                .nth(1)
+                .expect("unread outline section");
+            // Declarations past line 160 should be in unread outline
+            assert!(
+                outline_part.contains("dense_op_45"),
+                "outline should include declarations outside read range"
+            );
+            // Declarations within lines 1..=160 must not be in outline
+            assert!(
+                !outline_part.contains("dense_op_01"),
+                "outline should not repeat declarations from read range"
+            );
+            assert!(
+                !outline_part.contains("dense_op_40"),
+                "outline should not repeat declarations from read range"
+            );
+            assert!(
+                !advisory_block.contains("Token Reduction"),
+                "advisory block must omit 'Token Reduction'"
+            );
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    let status = harness.status().await;
+    assert_eq!(status.hooks_served, 1);
+    assert_eq!(status.macro_reads, 1);
+    assert!(status.submissions >= 1);
+    assert!(status.delivered_bytes_served > 0);
+    assert!(status.delivered_bytes_served <= 9_200);
+    assert_file_unchanged(&harness.dense_service_file, &harness.dense_service_content);
+    assert_mtime_unchanged(&harness.dense_service_file, mtime_before);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn opencode_stdin_micro_read_omits_advisory_and_preserves_mtime() {
+    let harness = TestHarness::start().await;
+    let mtime_before = std::fs::metadata(&harness.sample_file)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+
+    let stdin_json = serde_json::json!({
+        "tool_name": "read",
+        "tool_input": {
+            "filePath": harness.sample_file,
+            "offset": 100,
+            "limit": 30
+        }
+    })
+    .to_string();
+
+    let args = DaemonArgs {
+        hook_post_read: true,
+        ..Default::default()
+    };
+    let (file, span) =
+        resolve_hook_input(&args, Some(&stdin_json)).expect("resolve OpenCode micro-read");
+    assert_eq!(span.vendor, Some(AgentVendor::OpenCode));
+
+    let (start_line, end_line, raw_read_bytes) =
+        compute_hook_read_metrics(&file, &span, &ReadBudgetEnv::default());
+    assert_eq!(start_line, Some(100));
+    assert_eq!(end_line, Some(129));
+    assert_eq!(raw_read_bytes, Some((30 * LINE_BYTE_LEN) as u64));
+
+    let resp = send_daemon_request(
+        &harness.socket_path,
+        DaemonRequest::PostReadHook {
+            file,
+            start_line,
+            end_line,
+            raw_read_bytes,
+            read_kind: Some(ReadKind::Micro),
+            total_lines: Some(TOTAL_LINES),
+            vendor: Some(AgentVendor::OpenCode),
+            is_full_read: Some(false),
+        },
+    )
+    .await
+    .expect("send PostReadHook for OpenCode micro");
+
+    match resp {
+        DaemonResponse::AdvisoryContext { advisory_block, .. } => {
+            assert!(
+                advisory_block.is_empty(),
+                "OpenCode micro-read must omit advisory context"
+            );
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    let status = harness.status().await;
+    assert_eq!(status.hooks_served, 1);
+    assert_eq!(status.micro_reads, 1);
+    assert_eq!(status.delivered_bytes_served, 0);
+    assert!(status.omitted_micro_reads >= 1);
+    assert_file_unchanged(&harness.sample_file, &harness.original_content);
+    assert_mtime_unchanged(&harness.sample_file, mtime_before);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn opencode_stdin_full_file_under_2000_lines_delivers_callers_without_skeleton() {
+    let harness = TestHarness::start().await;
+    let mtime_before = std::fs::metadata(&harness.service_file)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+
+    // OpenCode reading service.rs (3 lines <= 2000 lines default limit)
+    let stdin_json = serde_json::json!({
+        "tool_name": "read",
+        "tool_input": {
+            "filePath": harness.service_file,
+            "offset": 1,
+            "limit": 2000
+        }
+    })
+    .to_string();
+
+    let args = DaemonArgs {
+        hook_post_read: true,
+        ..Default::default()
+    };
+    let (file, span) =
+        resolve_hook_input(&args, Some(&stdin_json)).expect("resolve OpenCode full-file read");
+    assert_eq!(span.vendor, Some(AgentVendor::OpenCode));
+
+    let (start_line, end_line, raw_read_bytes) =
+        compute_hook_read_metrics(&file, &span, &ReadBudgetEnv::default());
+    assert_eq!(start_line, Some(1));
+    assert_eq!(end_line, Some(3));
+
+    let resp = send_daemon_request(
+        &harness.socket_path,
+        DaemonRequest::PostReadHook {
+            file,
+            start_line,
+            end_line,
+            raw_read_bytes,
+            read_kind: Some(ReadKind::Macro),
+            total_lines: Some(3),
+            vendor: Some(AgentVendor::OpenCode),
+            is_full_read: Some(true),
+        },
+    )
+    .await
+    .expect("send PostReadHook for OpenCode full-file");
+
+    match resp {
+        DaemonResponse::AdvisoryContext { advisory_block, .. } => {
+            assert!(
+                !advisory_block.is_empty(),
+                "OpenCode full-file read with callers must deliver non-empty advisory"
+            );
+            assert!(
+                advisory_block.contains("## Upstream Callers"),
+                "advisory must include upstream callers"
+            );
+            assert!(
+                advisory_block.contains("caller.rs:"),
+                "callers must reference caller.rs"
+            );
+            assert!(
+                !advisory_block.contains("## Type Skeleton"),
+                "advisory must omit self-skeleton"
+            );
+            assert!(
+                !advisory_block.contains("Token Reduction"),
+                "advisory must omit 'Token Reduction'"
+            );
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    let status = harness.status().await;
+    assert_eq!(status.hooks_served, 1);
+    assert_eq!(status.macro_reads, 1);
+    assert!(status.submissions >= 1);
+    assert!(status.omitted_full_read_skeletons >= 1);
+    assert!(status.delivered_bytes_served > 0);
+    assert_file_unchanged(&harness.service_file, &harness.service_content);
+    assert_mtime_unchanged(&harness.service_file, mtime_before);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn opencode_stdin_partial_macro_over_2000_lines_delivers_outline_and_preserves_mtime() {
+    let harness = TestHarness::start().await;
+    let mtime_before = std::fs::metadata(&harness.sample_file)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+
+    // OpenCode reading sample.rs (2500 lines > 2000 lines default limit)
+    let stdin_json = serde_json::json!({
+        "tool_name": "read",
+        "tool_input": {
+            "filePath": harness.sample_file,
+            "offset": 1,
+            "limit": 2000
+        }
+    })
+    .to_string();
+
+    let args = DaemonArgs {
+        hook_post_read: true,
+        ..Default::default()
+    };
+    let (file, span) =
+        resolve_hook_input(&args, Some(&stdin_json)).expect("resolve OpenCode partial read");
+    assert_eq!(span.vendor, Some(AgentVendor::OpenCode));
+
+    let (start_line, end_line, raw_read_bytes) =
+        compute_hook_read_metrics(&file, &span, &ReadBudgetEnv::default());
+    assert_eq!(start_line, Some(1));
+    assert_eq!(end_line, Some(2000));
+
+    let resp = send_daemon_request(
+        &harness.socket_path,
+        DaemonRequest::PostReadHook {
+            file,
+            start_line,
+            end_line,
+            raw_read_bytes,
+            read_kind: Some(ReadKind::Macro),
+            total_lines: Some(TOTAL_LINES),
+            vendor: Some(AgentVendor::OpenCode),
+            is_full_read: Some(false),
+        },
+    )
+    .await
+    .expect("send PostReadHook for OpenCode partial read");
+
+    match resp {
+        DaemonResponse::AdvisoryContext { advisory_block, .. } => {
+            assert!(
+                !advisory_block.is_empty(),
+                "OpenCode >2000 line read must deliver unread outline"
+            );
+            assert!(
+                advisory_block.chars().count() <= 9_200,
+                "advisory block must be bounded within 9,200 char wire limit"
+            );
+            assert!(
+                advisory_block.contains("## Unread File Outline"),
+                "advisory must contain unread outline"
+            );
+            assert_eq!(
+                advisory_block.matches("```").count() % 2,
+                0,
+                "code fences must remain balanced"
+            );
+            assert!(
+                !advisory_block.contains("Token Reduction"),
+                "advisory must omit 'Token Reduction'"
+            );
+            // Declarations past line 2000 should be in outline
+            assert!(
+                advisory_block.contains("item_2001"),
+                "outline must contain unread declarations past line 2000"
+            );
+            // Declarations within 1..=2000 must NOT be in outline
+            assert!(
+                !advisory_block.contains("item_0001"),
+                "outline must not contain already-read declarations from lines 1..=2000"
+            );
+            assert!(
+                !advisory_block.contains("item_2000"),
+                "outline must not contain already-read declarations from lines 1..=2000"
+            );
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    let status = harness.status().await;
+    assert_eq!(status.hooks_served, 1);
+    assert_eq!(status.macro_reads, 1);
+    assert!(status.submissions >= 1);
+    assert!(status.delivered_bytes_served > 0);
+    assert!(status.delivered_bytes_served <= 9_200);
+    assert_file_unchanged(&harness.sample_file, &harness.original_content);
+    assert_mtime_unchanged(&harness.sample_file, mtime_before);
 
     harness.shutdown().await;
 }

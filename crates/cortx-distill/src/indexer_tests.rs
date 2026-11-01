@@ -1,4 +1,5 @@
 use super::*;
+use rustc_hash::FxHashSet;
 
 #[test]
 fn test_indexing_calls_and_contracts() {
@@ -533,6 +534,7 @@ fn test_get_file_symbols_fast_path_and_normalization() {
         file: file1.to_string(),
         line: 10,
         language: "rust".to_string(),
+        ..Default::default()
     });
     idx.record_symbol(SymbolDef {
         name: "ApiService".to_string(),
@@ -540,6 +542,7 @@ fn test_get_file_symbols_fast_path_and_normalization() {
         file: file2.to_string(),
         line: 15,
         language: "rust".to_string(),
+        ..Default::default()
     });
 
     // 1. Exact path lookup
@@ -587,6 +590,7 @@ fn test_collect_callers_and_callees_equivalence_and_dedup() {
         file: file.to_string(),
         line: 1,
         language: "rust".to_string(),
+        ..Default::default()
     });
     idx.record_symbol(SymbolDef {
         name: "helper".to_string(),
@@ -594,22 +598,26 @@ fn test_collect_callers_and_callees_equivalence_and_dedup() {
         file: file.to_string(),
         line: 10,
         language: "rust".to_string(),
+        ..Default::default()
     });
 
     let edge_a = CallEdge {
         caller: "caller_a".into(),
         callee: "entrypoint".into(),
         file: "/project/src/caller_a.rs".into(),
+        call_line: 0,
     };
     let edge_b = CallEdge {
         caller: "caller_b".into(),
         callee: "helper".into(),
         file: "/project/src/caller_b.rs".into(),
+        call_line: 0,
     };
     let edge_shared = CallEdge {
         caller: "caller_shared".into(),
         callee: "helper".into(),
         file: "/project/src/caller_shared.rs".into(),
+        call_line: 0,
     };
 
     // Add callers
@@ -619,16 +627,19 @@ fn test_collect_callers_and_callees_equivalence_and_dedup() {
         caller: idx.pool.intern(&edge_a.caller),
         callee: idx.pool.intern(&edge_a.callee),
         file: idx.pool.intern(&edge_a.file),
+        call_line: 0,
     };
     let c_edge_b = CompactCallEdge {
         caller: idx.pool.intern(&edge_b.caller),
         callee: idx.pool.intern(&edge_b.callee),
         file: idx.pool.intern(&edge_b.file),
+        call_line: 0,
     };
     let c_edge_shared = CompactCallEdge {
         caller: idx.pool.intern(&edge_shared.caller),
         callee: idx.pool.intern(&edge_shared.callee),
         file: idx.pool.intern(&edge_shared.file),
+        call_line: 0,
     };
 
     idx.callers_map
@@ -641,7 +652,7 @@ fn test_collect_callers_and_callees_equivalence_and_dedup() {
         .extend(vec![c_edge_b, c_edge_shared]);
 
     let mut callers = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     idx.collect_callers_into("entrypoint", 2, &mut callers, &mut seen);
     assert_eq!(callers.len(), 2);
 
@@ -667,7 +678,7 @@ fn test_collect_callers_and_callees_equivalence_and_dedup() {
         .extend(vec![c_edge_a, c_edge_shared]);
 
     let mut callees = Vec::new();
-    let mut seen_callees = HashSet::new();
+    let mut seen_callees = FxHashSet::default();
     idx.collect_callees_into("caller_shared", 2, &mut callees, &mut seen_callees);
     assert_eq!(callees.len(), 2);
     assert_eq!(callees, vec![edge_a.clone(), edge_shared.clone()]);
@@ -706,16 +717,23 @@ fn test_string_pool() {
     assert_eq!(pool.len(), 2);
     assert!(!pool.is_empty());
 
-    // Verify CompactCallEdge size is exactly 12 bytes
-    assert_eq!(std::mem::size_of::<CompactCallEdge>(), 12);
+    let id_d = pool.intern_string("owned_func".to_string());
+    assert_eq!(pool.intern("owned_func"), id_d);
+    assert_eq!(pool.len(), 3);
+
+    // Verify CompactCallEdge size is exactly 16 bytes (4 * 4-byte fields)
+    assert_eq!(std::mem::size_of::<SymbolId>(), 4);
+    assert_eq!(std::mem::size_of::<CompactCallEdge>(), 16);
     let edge = CompactCallEdge {
         caller: id_a,
         callee: id_c,
         file: id_a,
+        call_line: 0,
     };
     assert_eq!(edge.caller, id_a);
     assert_eq!(edge.callee, id_c);
     assert_eq!(edge.file, id_a);
+    assert_eq!(edge.call_line, 0);
 }
 
 #[test]
@@ -726,16 +744,19 @@ fn test_call_edge_fidelity_cycles_overlay_and_parallel_merge() {
         caller: "node_a".to_string(),
         callee: "node_b".to_string(),
         file: "src/file_a.rs".to_string(),
+        call_line: 0,
     };
     let edge_bc = CallEdge {
         caller: "node_b".to_string(),
         callee: "node_c".to_string(),
         file: "src/file_b.rs".to_string(),
+        call_line: 0,
     };
     let edge_ca = CallEdge {
         caller: "node_c".to_string(),
         callee: "node_a".to_string(),
         file: "src/file_c.rs".to_string(),
+        call_line: 0,
     };
 
     idx_cycle.add_call_edge(edge_ab.clone());
@@ -762,6 +783,7 @@ fn test_call_edge_fidelity_cycles_overlay_and_parallel_merge() {
         caller: "fn_base_caller".to_string(),
         callee: "fn_shared".to_string(),
         file: "src/base.rs".to_string(),
+        call_line: 0,
     };
     base_idx.add_call_edge(base_edge.clone());
 
@@ -770,6 +792,7 @@ fn test_call_edge_fidelity_cycles_overlay_and_parallel_merge() {
         caller: "fn_overlay_caller".to_string(),
         callee: "fn_overlay_target".to_string(),
         file: "src/overlay.rs".to_string(),
+        call_line: 0,
     };
     overlay_idx.add_call_edge(overlay_edge.clone());
 
@@ -792,11 +815,13 @@ fn test_call_edge_fidelity_cycles_overlay_and_parallel_merge() {
         caller: "caller_x".to_string(),
         callee: "common_fn".to_string(),
         file: "src/x.rs".to_string(),
+        call_line: 0,
     };
     let edge_leaf1 = CallEdge {
         caller: "common_fn".to_string(),
         callee: "leaf_1".to_string(),
         file: "src/x.rs".to_string(),
+        call_line: 0,
     };
     idx1.add_call_edge(edge_x.clone());
     idx1.add_call_edge(edge_leaf1.clone());
@@ -806,11 +831,13 @@ fn test_call_edge_fidelity_cycles_overlay_and_parallel_merge() {
         caller: "caller_y".to_string(),
         callee: "common_fn".to_string(),
         file: "src/y.rs".to_string(),
+        call_line: 0,
     };
     let edge_leaf2 = CallEdge {
         caller: "common_fn".to_string(),
         callee: "leaf_2".to_string(),
         file: "src/y.rs".to_string(),
+        call_line: 0,
     };
     idx2.add_call_edge(edge_y.clone());
     idx2.add_call_edge(edge_leaf2.clone());
@@ -1014,4 +1041,207 @@ fn test_collect_source_files_omit_tests_filtering() {
             "mod.rs"
         ]
     );
+}
+
+#[test]
+fn test_distill_skeleton_cache_hit_and_mtime_invalidation() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("service.rs");
+    std::fs::write(
+        &file_path,
+        r#"
+        pub struct Service {
+            pub id: u64,
+        }
+        impl Service {
+            pub fn run(&self) {
+                println!("Heavy internal implementation");
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let index = SymbolIndex::new();
+
+    // 1. Initial touch: cache miss, extracts skeleton and populates cache
+    let bundle1 = crate::distill_target_with_overlay(
+        &file_path,
+        crate::DistillMode::Bundle,
+        Some(&index),
+        None,
+    )
+    .unwrap();
+    assert!(bundle1.skeleton.contains("pub struct Service"));
+    assert!(bundle1.skeleton.contains("pub fn run(&self)"));
+    assert!(!bundle1.skeleton.contains("Heavy internal implementation"));
+
+    let initial_mtime = {
+        let cache = index.skeleton_cache.read();
+        assert_eq!(cache.len(), 1);
+        let (mt, cached_skel) = cache.get(&file_path).expect("must be cached");
+        assert_eq!(cached_skel.as_ref(), &bundle1.skeleton);
+        *mt
+    };
+
+    // 2. Second touch with sentinel: proves cache hit directly returns cached skeleton without reparsing
+    {
+        let mut cache = index.skeleton_cache.write();
+        cache.insert(
+            file_path.clone(),
+            (
+                initial_mtime,
+                std::sync::Arc::from("/* sentinel cached skeleton */"),
+            ),
+        );
+    }
+
+    let bundle2 = crate::distill_target_with_overlay(
+        &file_path,
+        crate::DistillMode::Bundle,
+        Some(&index),
+        None,
+    )
+    .unwrap();
+    assert_eq!(bundle2.skeleton, "/* sentinel cached skeleton */");
+
+    // 3. File modified on disk: mtime advances, cache miss triggers re-distill
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(
+        &file_path,
+        r#"
+        pub struct UpdatedService {
+            pub new_field: bool,
+        }
+        "#,
+    )
+    .unwrap();
+
+    let bundle3 = crate::distill_target_with_overlay(
+        &file_path,
+        crate::DistillMode::Bundle,
+        Some(&index),
+        None,
+    )
+    .unwrap();
+    assert!(bundle3.skeleton.contains("pub struct UpdatedService"));
+    assert_ne!(bundle3.skeleton, "/* sentinel cached skeleton */");
+
+    let updated_mtime = {
+        let cache = index.skeleton_cache.read();
+        let (mt, _) = cache.get(&file_path).unwrap();
+        *mt
+    };
+    assert_ne!(initial_mtime, updated_mtime);
+
+    // 4. Watch batch invalidation on file modification
+    let batch_index = SymbolIndex::new();
+    batch_index.skeleton_cache.write().insert(
+        file_path.clone(),
+        (updated_mtime, std::sync::Arc::from("/* cached */")),
+    );
+    assert_eq!(batch_index.skeleton_cache.read().len(), 1);
+
+    let outcome = batch_index.apply_watch_batch(WatchBatchUpdate {
+        upserted: std::slice::from_ref(&file_path),
+        removed: &[],
+        project_cfg: None,
+    });
+    assert_eq!(outcome.next_index.skeleton_cache.read().len(), 0);
+}
+
+#[test]
+fn test_distill_skeleton_cache_overlay_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("model.rs");
+    std::fs::write(&file_path, "pub struct Model;").unwrap();
+    let mtime = std::fs::metadata(&file_path).unwrap().modified().unwrap();
+
+    let base_index = SymbolIndex::new();
+    let overlay_index = SymbolIndex::new();
+
+    base_index.skeleton_cache.write().insert(
+        file_path.clone(),
+        (mtime, std::sync::Arc::from("/* base cached */")),
+    );
+    overlay_index.skeleton_cache.write().insert(
+        file_path.clone(),
+        (mtime, std::sync::Arc::from("/* overlay cached */")),
+    );
+
+    let bundle = crate::distill_target_with_overlay(
+        &file_path,
+        crate::DistillMode::Bundle,
+        Some(&base_index),
+        Some(&overlay_index),
+    )
+    .unwrap();
+
+    assert_eq!(bundle.skeleton, "/* overlay cached */");
+}
+
+#[test]
+fn test_overlay_view_pass_through_and_contract_dedup() {
+    let mut base_idx = SymbolIndex::new();
+    base_idx.record_call_edge_with_line("caller_base_1", "callee_target", "src/base1.rs", 10);
+    base_idx.record_call_edge_with_line("caller_base_2", "callee_target", "src/shadowed.rs", 20);
+    base_idx.contracts_map.insert(
+        "Widget".to_string(),
+        vec![ContractInfo {
+            trait_name: "Render".to_string(),
+            target_type: "Widget".to_string(),
+            methods: vec!["render".to_string()],
+            file: "src/base1.rs".to_string(),
+        }],
+    );
+
+    // 1. Non-worktree view: pass-through fast-path
+    let fast_view = OverlayView {
+        base: Some(&base_idx),
+        overlay: None,
+        shadowed_files: None,
+    };
+
+    let mut callers = Vec::new();
+    let mut seen = rustc_hash::FxHashSet::default();
+    fast_view.collect_callers_into("callee_target", 1, &mut callers, &mut seen);
+    assert_eq!(callers.len(), 2);
+
+    let contracts = fast_view.get_contracts("Widget");
+    assert_eq!(contracts.len(), 1);
+    assert_eq!(contracts[0].trait_name, "Render");
+
+    // 2. Worktree view: overlay overrides and shadowed files filter
+    let mut overlay_idx = SymbolIndex::new();
+    overlay_idx.record_call_edge_with_line("caller_overlay", "callee_target", "src/overlay.rs", 5);
+    overlay_idx.contracts_map.insert(
+        "Widget".to_string(),
+        vec![ContractInfo {
+            trait_name: "Render".to_string(),
+            target_type: "Widget".to_string(),
+            methods: vec!["render".to_string()],
+            file: "src/base1.rs".to_string(),
+        }],
+    );
+
+    let mut shadowed = HashSet::new();
+    shadowed.insert(PathBuf::from("src/shadowed.rs"));
+
+    let worktree_view = OverlayView {
+        base: Some(&base_idx),
+        overlay: Some(&overlay_idx),
+        shadowed_files: Some(&shadowed),
+    };
+
+    let mut wt_callers = Vec::new();
+    let mut wt_seen = rustc_hash::FxHashSet::default();
+    worktree_view.collect_callers_into("callee_target", 1, &mut wt_callers, &mut wt_seen);
+    let caller_names: Vec<&str> = wt_callers.iter().map(|e| e.caller.as_str()).collect();
+    assert!(caller_names.contains(&"caller_overlay"));
+    assert!(caller_names.contains(&"caller_base_1"));
+    assert!(!caller_names.contains(&"caller_base_2"));
+
+    // Contracts deduplicated across overlay and base
+    let wt_contracts = worktree_view.get_contracts("Widget");
+    assert_eq!(wt_contracts.len(), 1);
 }

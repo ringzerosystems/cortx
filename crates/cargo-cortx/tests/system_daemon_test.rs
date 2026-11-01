@@ -226,6 +226,18 @@ impl FeatRunner for FeatOneService {
     )
     .unwrap();
 
+    let feat1_caller = wt_feat1.join("src").join("caller.rs");
+    std::fs::write(
+        &feat1_caller,
+        r#"use crate::lib::{FeatOneService, FeatRunner};
+
+pub fn trigger_feat_pipeline(svc: &FeatOneService) -> bool {
+    svc.execute_feat()
+}
+"#,
+    )
+    .unwrap();
+
     // 3. Launch single system-wide daemon instance
     let socket_path = base_path.join("system_daemon.sock");
     let log_dir = base_path.join("logs");
@@ -284,6 +296,8 @@ impl FeatRunner for FeatOneService {
     assert!(hook_alpha_str.contains("<!-- cortx-context-provenance: daemon (socket:"));
     assert!(hook_alpha_str.contains("AlphaService"));
     assert!(hook_alpha_str.contains("AlphaRunner"));
+    assert!(!hook_alpha_str.contains("## Type Skeleton"));
+    assert!(!hook_alpha_str.contains("Token Reduction"));
 
     // 5. Issue post-read hook for repo_beta file -> assert lazy cold-start and context distillation
     let hook_beta = cortx_cmd(cortx_bin)
@@ -304,6 +318,8 @@ impl FeatRunner for FeatOneService {
     assert!(hook_beta_str.contains("<!-- cortx-context-provenance: daemon (socket:"));
     assert!(hook_beta_str.contains("BetaService"));
     assert!(hook_beta_str.contains("BetaRunner"));
+    assert!(!hook_beta_str.contains("## Type Skeleton"));
+    assert!(!hook_beta_str.contains("Token Reduction"));
 
     // 6. Issue post-read hook for worktree feat1 -> assert worktree overlay resolution
     let hook_wt = cortx_cmd(cortx_bin)
@@ -323,7 +339,12 @@ impl FeatRunner for FeatOneService {
     let hook_wt_str = String::from_utf8_lossy(&hook_wt.stdout);
     assert!(hook_wt_str.contains("<!-- cortx-context-provenance: daemon (socket:"));
     assert!(hook_wt_str.contains("FeatOneService"));
-    assert!(hook_wt_str.contains("extra"));
+    assert!(hook_wt_str.contains("FeatRunner"));
+    assert!(hook_wt_str.contains("## Upstream Callers"));
+    assert!(hook_wt_str.contains("trigger_feat_pipeline"));
+    assert!(hook_wt_str.contains("caller.rs"));
+    assert!(!hook_wt_str.contains("## Type Skeleton"));
+    assert!(!hook_wt_str.contains("Token Reduction"));
 
     // 7. Query daemon status via JSON to verify telemetry and workspace breakdown
     let status_json_out = cortx_cmd(cortx_bin)

@@ -4,7 +4,7 @@ use crate::error::CoreError;
 use crate::output::OutputFormat;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Standard universal build artifacts, dependency directories, and VCS metadata.
@@ -370,6 +370,13 @@ pub struct ProjectConfig {
     /// Per-project cross-boundary contract options.
     #[serde(default)]
     pub cross_boundary: CrossBoundaryConfig,
+
+    /// Precomputed normalized ignored path prefixes for zero-allocation checks.
+    #[serde(skip)]
+    pub precomputed_ignored_prefixes: Vec<PathBuf>,
+    /// Precomputed ignored path component names for fast O(1) set lookup.
+    #[serde(skip)]
+    pub precomputed_ignored_components: HashSet<String>,
 }
 
 impl Default for ProjectConfig {
@@ -392,6 +399,8 @@ impl Default for ProjectConfig {
             typescript: TypeScriptConfig::default(),
             go: GoConfig::default(),
             cross_boundary: CrossBoundaryConfig::default(),
+            precomputed_ignored_prefixes: Vec::new(),
+            precomputed_ignored_components: HashSet::new(),
         }
     }
 }
@@ -422,6 +431,7 @@ impl ProjectConfig {
             typescript: cfg.typescript.clone(),
             go: cfg.go.clone(),
             cross_boundary: cfg.cross_boundary.clone(),
+            ..Default::default()
         };
         proj.normalize();
         proj
@@ -452,6 +462,35 @@ impl ProjectConfig {
             self.distill.custom_ignored_dirs.sort();
             self.distill.custom_ignored_dirs.dedup();
         }
+        self.recompute_ignored_caches();
+    }
+
+    /// Precomputes normalized ignored path prefixes and single-component names
+    /// to eliminate allocations during recursive directory discovery.
+    pub fn recompute_ignored_caches(&mut self) {
+        let mut prefixes = Vec::new();
+        let mut components = HashSet::new();
+
+        for d in self
+            .ignored_dirs
+            .iter()
+            .chain(&self.custom_ignored_dirs)
+            .chain(&self.distill.custom_ignored_dirs)
+        {
+            let pat = normalize_rel_pattern(d);
+            if !pat.as_os_str().is_empty() {
+                prefixes.push(pat.to_path_buf());
+                if pat.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+                    if let Some(s) = pat.to_str() {
+                        components.insert(s.to_string());
+                    }
+                }
+            }
+        }
+        prefixes.sort();
+        prefixes.dedup();
+        self.precomputed_ignored_prefixes = prefixes;
+        self.precomputed_ignored_components = components;
     }
 
     /// Determines whether a path relative to the workspace root should be ignored,
@@ -459,7 +498,18 @@ impl ProjectConfig {
     /// and distillation `custom_ignored_dirs`.
     pub fn is_relative_path_ignored(&self, rel: &Path) -> bool {
         let rel = rel.strip_prefix(".").unwrap_or(rel);
-        if self
+        let has_cached = !self.precomputed_ignored_prefixes.is_empty()
+            || !self.precomputed_ignored_components.is_empty();
+
+        if has_cached {
+            if self
+                .precomputed_ignored_prefixes
+                .iter()
+                .any(|p| rel.starts_with(p))
+            {
+                return true;
+            }
+        } else if self
             .ignored_dirs
             .iter()
             .chain(&self.custom_ignored_dirs)
@@ -471,13 +521,18 @@ impl ProjectConfig {
         {
             return true;
         }
+
         for comp in rel.components() {
             if let std::path::Component::Normal(c) = comp {
                 if let Some(s) = c.to_str() {
                     if STANDARD_IGNORED_DIRS.contains(&s) {
                         return true;
                     }
-                    if self
+                    if has_cached {
+                        if self.precomputed_ignored_components.contains(s) {
+                            return true;
+                        }
+                    } else if self
                         .ignored_dirs
                         .iter()
                         .chain(&self.custom_ignored_dirs)
@@ -715,7 +770,7 @@ pub fn resolve_global_config_path() -> PathBuf {
     resolve_default_config_path()
 }
 
-fn canonicalize_best_effort(path: &Path) -> PathBuf {
+pub fn canonicalize_best_effort(path: &Path) -> PathBuf {
     if let Ok(c) = std::fs::canonicalize(path) {
         return c;
     }

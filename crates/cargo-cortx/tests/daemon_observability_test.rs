@@ -3,6 +3,7 @@
 
 use cortx_daemon::{DaemonStatusInfo, ServerOptions, run_server_with_options};
 use cortx_distill::SymbolIndex;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::process::Command;
@@ -130,6 +131,8 @@ impl Runner for Service {
     assert!(status_out.status.success(), "status must succeed");
     let status_str = String::from_utf8_lossy(&status_out.stdout);
     assert!(status_str.contains("Cortx Daemon Status:  Active"));
+    assert!(status_str.contains("Daemon Version / Protocol:"));
+    assert!(status_str.contains("protocol v2"));
     assert!(status_str.contains("PID:"));
     assert!(status_str.contains("Uptime:"));
     assert!(status_str.contains("Indexed Files:        1 files"));
@@ -154,13 +157,11 @@ impl Runner for Service {
     let json_str = String::from_utf8_lossy(&status_json_out.stdout);
     let status_info: DaemonStatusInfo =
         serde_json::from_str(&json_str).expect("status must be valid JSON");
+    assert_eq!(status_info.protocol_version, cortx_daemon::PROTOCOL_VERSION);
     assert_eq!(status_info.indexed_files, 1);
     assert!(status_info.total_symbols >= 2);
     assert_eq!(status_info.pid, std::process::id());
     assert_eq!(status_info.hooks_served, 0);
-    assert_eq!(status_info.bytes_saved, 0);
-    assert_eq!(status_info.token_reduction_pct, 0.0);
-    assert_eq!(status_info.est_tokens_saved, 0);
     assert_eq!(status_info.macro_reads, 0);
     assert_eq!(status_info.micro_reads, 0);
     assert_eq!(status_info.supplemental_context_bytes, 0);
@@ -209,9 +210,6 @@ impl Runner for Service {
     assert_eq!(post_status_info.hooks_served, 1);
     assert!(post_status_info.raw_bytes_served > 0);
     assert!(post_status_info.delivered_bytes_served > 0);
-    assert!(post_status_info.bytes_saved > 0);
-    assert!(post_status_info.token_reduction_pct > 0.0);
-    assert!(post_status_info.est_tokens_saved > 0);
     assert_eq!(post_status_info.macro_reads, 1);
     assert_eq!(post_status_info.micro_reads, 0);
     assert!(post_status_info.supplemental_context_bytes > 0);
@@ -236,7 +234,7 @@ impl Runner for Service {
     assert!(post_table_str.contains("1 macro, 0 micro"));
     assert!(post_table_str.contains("Supplemental Context:"));
 
-    // 6b. Issue a micro-read hook call (offset: 10, limit: 5) and verify micro_reads increments
+    // 6b. Issue a micro-read hook call (offset: 10, limit: 5) and verify micro_reads short-circuits at CLI
     let hook_micro_out = cortx_cmd(cortx_bin)
         .args([
             "daemon",
@@ -255,6 +253,36 @@ impl Runner for Service {
         .await
         .expect("failed to execute cortx daemon --hook-post-read micro");
     assert!(hook_micro_out.status.success());
+    assert!(
+        hook_micro_out.stdout.is_empty(),
+        "micro-read must short-circuit with empty output at CLI boundary"
+    );
+
+    // Send a direct IPC PostReadHook with Micro read kind to verify daemon telemetry
+    let micro_resp = cortx_daemon::send_daemon_request(
+        &socket_path,
+        cortx_daemon::DaemonRequest::PostReadHook {
+            file: test_file.clone(),
+            start_line: Some(10),
+            end_line: Some(14),
+            raw_read_bytes: Some(100),
+            read_kind: Some(cortx_core::ReadKind::Micro),
+            total_lines: Some(73),
+            vendor: Some(cortx_core::span::AgentVendor::Claude),
+            is_full_read: Some(false),
+        },
+    )
+    .await
+    .expect("send direct micro post read hook");
+    match micro_resp {
+        cortx_daemon::DaemonResponse::AdvisoryContext { advisory_block, .. } => {
+            assert!(
+                advisory_block.is_empty(),
+                "daemon micro read must return empty advisory"
+            );
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
 
     let status_post_micro_json_out = cortx_cmd(cortx_bin)
         .args([
@@ -275,11 +303,12 @@ impl Runner for Service {
     assert_eq!(post_micro_status.hooks_served, 2);
     assert_eq!(post_micro_status.macro_reads, 1);
     assert_eq!(post_micro_status.micro_reads, 1);
+    assert_eq!(post_micro_status.omitted_micro_reads, 1);
     assert!(
         post_micro_status
             .workspaces
             .iter()
-            .any(|ws| ws.macro_reads == 1 && ws.micro_reads == 1),
+            .any(|ws| ws.macro_reads == 1 && ws.micro_reads == 1 && ws.omitted_micro_reads == 1),
         "expected at least one workspace to record 1 macro and 1 micro read"
     );
 
@@ -400,10 +429,11 @@ async fn test_in_process_fallback_bloat_guard() {
         "CRITICAL INVARIANT: target file on disk modified during hook execution"
     );
 
-    // Case 2: Realistic file with unbounded Generic budget delivers skeleton
+    // Case 2: Realistic file with trait contracts delivers contracts on FullFile fallback
     let realistic_file = src_dir.join("service.rs");
-    let mut realistic_content =
-        String::from("pub struct Worker {\n    pub id: u64,\n}\n\nimpl Worker {\n");
+    let mut realistic_content = String::from(
+        "pub trait WorkerTask {\n    fn run_task(&self) -> u64;\n}\n\npub struct Worker {\n    pub id: u64,\n}\n\nimpl WorkerTask for Worker {\n    fn run_task(&self) -> u64 { self.task_0() }\n}\n\nimpl Worker {\n",
+    );
     for i in 0..30 {
         use std::fmt::Write;
         let _ = writeln!(
@@ -439,9 +469,20 @@ async fn test_in_process_fallback_bloat_guard() {
         stdout_real
     );
     assert!(
-        stdout_real.contains("pub struct Worker"),
-        "expected stripped skeleton in output, got:\n{}",
+        stdout_real.contains("impl WorkerTask for Worker"),
+        "expected trait contract in output, got:\n{}",
         stdout_real
+    );
+    assert!(
+        !stdout_real.contains("pub fn task_00"),
+        "expected self-skeleton omitted on FullFile read, got:\n{}",
+        stdout_real
+    );
+
+    // Verify standalone offline fallback does NOT spawn a daemon
+    assert!(
+        !nonexistent_socket.exists(),
+        "standalone offline fallback with explicit socket must not spawn daemon"
     );
 
     let real_bytes_after = std::fs::read(&realistic_file).unwrap();
@@ -449,4 +490,185 @@ async fn test_in_process_fallback_bloat_guard() {
         real_bytes_before, real_bytes_after,
         "CRITICAL INVARIANT: target file on disk modified during hook execution"
     );
+}
+
+#[tokio::test]
+async fn test_protocol_mismatch_fail_open_warning() {
+    let cortx_bin = env!("CARGO_BIN_EXE_cortx");
+    let base = tempdir().unwrap();
+    let src_dir = base.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+
+    let test_file = src_dir.join("calc.rs");
+    let test_content = br#"pub trait Calculator {
+    fn compute(&self, val: u64) -> u64;
+}
+
+pub struct SimpleCalc;
+
+impl Calculator for SimpleCalc {
+    fn compute(&self, val: u64) -> u64 {
+        val * 42
+    }
+}
+"#;
+    std::fs::write(&test_file, test_content).unwrap();
+
+    let mock_socket = base.path().join("mock_v1.sock");
+    let listener = tokio::net::UnixListener::bind(&mock_socket).expect("bind mock v1 socket");
+
+    // Spawn mock server returning protocol_version: 0 (simulating v0 or v1 daemon)
+    let server_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let Ok(req) =
+                cortx_daemon::read_message::<_, cortx_daemon::DaemonRequest>(&mut stream).await
+            else {
+                // Ignore probe connections that immediately close (e.g. is_socket_alive)
+                continue;
+            };
+            match req {
+                cortx_daemon::DaemonRequest::PostReadHook { file, .. } => {
+                    let resp = cortx_daemon::DaemonResponse::AdvisoryContext {
+                        file: file.display().to_string(),
+                        advisory_block: "# Stale Mock Context".to_string(),
+                        protocol_version: 0, // Mock protocol v0/v1 mismatch!
+                    };
+                    let _ = cortx_daemon::write_message(&mut stream, &resp).await;
+                }
+                cortx_daemon::DaemonRequest::Status => {
+                    let resp = cortx_daemon::DaemonResponse::Status(DaemonStatusInfo {
+                        protocol_version: 0,
+                        daemon_version: "0.0.1".to_string(),
+                        pid: std::process::id(),
+                        uptime_secs: 120,
+                        socket_path: PathBuf::from("/mock/socket.sock"),
+                        daemon_mode: "System-Wide Multi-Tenant".to_string(),
+                        config_path: None,
+                        declared_projects_count: 0,
+                        main_log_path: PathBuf::from("/tmp/mock.log"),
+                        memory_rss_mb: 10.0,
+                        active_workspaces_count: 1,
+                        workspaces: Vec::new(),
+                        workspace_root: PathBuf::new(),
+                        indexed_files: 1,
+                        total_symbols: 2,
+                        total_call_edges: 0,
+                        total_contracts: 1,
+                        total_routes: 0,
+                        watcher_active: false,
+                        hooks_served: 1,
+                        submissions: 0,
+                        callgraph_drops: 0,
+                        ast_drops: 0,
+                        raw_bytes_served: 0,
+                        delivered_bytes_served: 0,
+                        macro_reads: 0,
+                        micro_reads: 0,
+                        omitted_micro_reads: 0,
+                        omitted_full_read_skeletons: 0,
+                        trimmed_advisories: 0,
+                        parse_fallbacks: 0,
+                        supplemental_context_bytes: 0,
+                        supplemental_context_tokens: 0,
+                    });
+                    let _ = cortx_daemon::write_message(&mut stream, &resp).await;
+                }
+                cortx_daemon::DaemonRequest::Shutdown => {
+                    let _ = cortx_daemon::write_message(
+                        &mut stream,
+                        &cortx_daemon::DaemonResponse::ShutdownAck,
+                    )
+                    .await;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // 1. Invoke --hook-post-read: CLI detects protocol_version: 0 != 2,
+    // logs warning to stderr, and fails open to in-process distillation.
+    let hook_out = cortx_cmd(cortx_bin)
+        .args([
+            "daemon",
+            "--hook-post-read",
+            "--file",
+            test_file.to_str().unwrap(),
+            "--socket",
+            mock_socket.to_str().unwrap(),
+        ])
+        .current_dir(base.path())
+        .output()
+        .await
+        .expect("execute hook with mock v1 socket");
+
+    assert!(
+        hook_out.status.success(),
+        "hook must succeed via fail-open fallback"
+    );
+    let stderr_str = String::from_utf8_lossy(&hook_out.stderr);
+    assert!(
+        stderr_str.contains("Warning: daemon on"),
+        "expected protocol mismatch warning in stderr, got:\n{}",
+        stderr_str
+    );
+    assert!(
+        stderr_str.contains("is running protocol version 0 (CLI expects protocol version 2); falling back to in-process distillation"),
+        "expected specific mismatch text in stderr, got:\n{}",
+        stderr_str
+    );
+
+    let stdout_str = String::from_utf8_lossy(&hook_out.stdout);
+    assert!(
+        stdout_str
+            .contains("<!-- cortx-context-provenance: in-process-fallback (protocol mismatch) -->"),
+        "expected protocol mismatch fallback provenance header, got:\n{}",
+        stdout_str
+    );
+    assert!(
+        stdout_str.contains("impl Calculator for SimpleCalc"),
+        "expected in-process distillation context, got:\n{}",
+        stdout_str
+    );
+    assert!(
+        !stdout_str.contains("# Stale Mock Context"),
+        "must not use stale mock daemon context"
+    );
+
+    // 2. Query status: CLI detects protocol mismatch, warns on stderr, prints status table without failure
+    let status_out = cortx_cmd(cortx_bin)
+        .args([
+            "daemon",
+            "--status",
+            "--socket",
+            mock_socket.to_str().unwrap(),
+        ])
+        .current_dir(base.path())
+        .output()
+        .await
+        .expect("execute status with mock v1 socket");
+
+    assert!(status_out.status.success(), "status query must succeed");
+    let status_stderr = String::from_utf8_lossy(&status_out.stderr);
+    assert!(
+        status_stderr.contains("Warning: daemon on"),
+        "expected status protocol mismatch warning in stderr, got:\n{}",
+        status_stderr
+    );
+    assert!(
+        status_stderr.contains("is running protocol version 0 (CLI expects protocol version 2). Restart daemon with 'cargo cortx daemon --stop'."),
+        "expected restart instruction in stderr, got:\n{}",
+        status_stderr
+    );
+
+    // 3. Verify server was NOT killed by CLI
+    assert!(
+        mock_socket.exists(),
+        "mock socket must not be unlinked or terminated by CLI"
+    );
+
+    server_task.abort();
 }

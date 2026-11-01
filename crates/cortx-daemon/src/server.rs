@@ -1,15 +1,17 @@
 //! Unix domain socket IPC server.
 
 use crate::error::DaemonError;
-use crate::hook::{execute_post_read_bundle, execute_post_read_bundle_for_project};
+use crate::hook::execute_post_read_query;
 use crate::logging::DaemonLogManager;
 use crate::protocol::{
-    DaemonRequest, DaemonResponse, DaemonStatusInfo, WorkspaceSummary, read_message, write_message,
+    DaemonRequest, DaemonResponse, DaemonStatusInfo, PROTOCOL_VERSION, WorkspaceSummary,
+    read_message, write_message,
 };
 use crate::registry::{WorkspaceEntry, WorkspaceRegistry};
 use crate::watcher::DynamicWatcherManager;
-use cortx_core::ReadKind;
-use cortx_distill::{SymbolIndex, distill_target, distill_target_for_project};
+use cortx_core::{AgentVendor, ReadCoverage, ReadKind, ReadSpan};
+use cortx_distill::bundle::AdvisoryDisposition;
+use cortx_distill::{DistillMode, DistillQuery, OverlayView, SymbolIndex};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,7 +21,7 @@ use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-/// Lock-free context bloat reduction telemetry counters.
+/// Lock-free server telemetry counters.
 #[derive(Debug, Default)]
 pub struct ServerTelemetry {
     pub hooks_served: AtomicU64,
@@ -28,26 +30,21 @@ pub struct ServerTelemetry {
     pub ast_drops: AtomicU64,
     pub raw_bytes_served: AtomicU64,
     pub delivered_bytes_served: AtomicU64,
-    pub bytes_saved: AtomicU64,
     pub macro_reads: AtomicU64,
     pub micro_reads: AtomicU64,
+    pub omitted_micro_reads: AtomicU64,
+    pub omitted_full_read_skeletons: AtomicU64,
+    pub trimmed_advisories: AtomicU64,
 }
 
 impl ServerTelemetry {
-    /// Records reduction metrics for a single request and returns the per-request reduction percentage.
-    pub fn record_reduction(&self, raw_bytes: u64, delivered_bytes: u64) -> f64 {
+    /// Records hook metrics (served count, raw bytes inspected, delivered advisory bytes).
+    pub fn record_hook_metrics(&self, raw_bytes: u64, delivered_bytes: u64) {
         self.hooks_served.fetch_add(1, Ordering::Relaxed);
         self.raw_bytes_served
             .fetch_add(raw_bytes, Ordering::Relaxed);
         self.delivered_bytes_served
             .fetch_add(delivered_bytes, Ordering::Relaxed);
-        let saved = raw_bytes.saturating_sub(delivered_bytes);
-        self.bytes_saved.fetch_add(saved, Ordering::Relaxed);
-        if raw_bytes > 0 {
-            ((raw_bytes as f64 - delivered_bytes as f64) / raw_bytes as f64) * 100.0
-        } else {
-            0.0
-        }
     }
 
     /// Increments the count of successful advisory context submissions.
@@ -87,20 +84,27 @@ impl ServerTelemetry {
         self.micro_reads.load(Ordering::Relaxed)
     }
 
-    /// Returns a snapshot of cumulative telemetry computed directly from `raw` vs `delivered`:
-    /// (hooks_served, raw_bytes, delivered_bytes, bytes_saved, reduction_pct, est_tokens_saved).
-    pub fn snapshot(&self) -> (u64, u64, u64, u64, f64, u64) {
+    /// Returns the total omitted micro reads count.
+    pub fn omitted_micro_reads(&self) -> u64 {
+        self.omitted_micro_reads.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total omitted full-read skeletons count.
+    pub fn omitted_full_read_skeletons(&self) -> u64 {
+        self.omitted_full_read_skeletons.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total trimmed advisories count.
+    pub fn trimmed_advisories(&self) -> u64 {
+        self.trimmed_advisories.load(Ordering::Relaxed)
+    }
+
+    /// Returns a snapshot of cumulative telemetry: (hooks_served, raw_bytes, delivered_bytes).
+    pub fn snapshot(&self) -> (u64, u64, u64) {
         let hooks = self.hooks_served.load(Ordering::Relaxed);
         let raw = self.raw_bytes_served.load(Ordering::Relaxed);
         let delivered = self.delivered_bytes_served.load(Ordering::Relaxed);
-        let saved = raw.saturating_sub(delivered);
-        let pct = if raw > 0 {
-            ((raw as f64 - delivered as f64) / raw as f64) * 100.0
-        } else {
-            0.0
-        };
-        let est_tokens = saved / cortx_core::span::EST_BYTES_PER_TOKEN;
-        (hooks, raw, delivered, saved, pct, est_tokens)
+        (hooks, raw, delivered)
     }
 }
 
@@ -285,17 +289,25 @@ pub async fn run_server_with_options(
         let _ = std::fs::create_dir_all(parent);
     }
 
-    if socket_path.exists() {
-        if probe_active_socket(socket_path).await {
-            return Err(DaemonError::SocketAlreadyBound(socket_path.clone()));
+    let listener = match UnixListener::bind(socket_path) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            if probe_active_socket(socket_path).await {
+                return Err(DaemonError::SocketAlreadyBound(socket_path.clone()));
+            }
+            let _ = std::fs::remove_file(socket_path);
+            UnixListener::bind(socket_path).map_err(|source| DaemonError::Socket {
+                path: socket_path.clone(),
+                source,
+            })?
         }
-        let _ = std::fs::remove_file(socket_path);
-    }
-
-    let listener = UnixListener::bind(socket_path).map_err(|source| DaemonError::Socket {
-        path: socket_path.clone(),
-        source,
-    })?;
+        Err(source) => {
+            return Err(DaemonError::Socket {
+                path: socket_path.clone(),
+                source,
+            });
+        }
+    };
 
     let _guard = SocketGuard::new(socket_path.clone());
     let start_time = std::time::Instant::now();
@@ -363,106 +375,26 @@ struct PostReadParams<'a> {
     end_line: Option<usize>,
     raw_read_bytes: Option<u64>,
     read_kind: Option<ReadKind>,
+    total_lines: Option<usize>,
+    vendor: Option<AgentVendor>,
+    is_full_read: Option<bool>,
 }
 
-fn classify_read(params: &PostReadParams<'_>, file: &Path) -> ReadKind {
-    if let Some(kind) = params.read_kind {
-        return kind;
+fn classify_coverage(
+    span: &ReadSpan,
+    total_lines: Option<usize>,
+    raw_bytes: Option<u64>,
+    is_full_read: Option<bool>,
+    read_kind: Option<ReadKind>,
+    env: &cortx_core::span::ReadBudgetEnv,
+) -> ReadCoverage {
+    if read_kind == Some(ReadKind::Micro) {
+        return ReadCoverage::Micro;
     }
-    let span = cortx_core::span::ReadSpan {
-        start_line: params.start_line,
-        end_line: params.end_line,
-        ..Default::default()
-    };
-    let total_lines = std::fs::read_to_string(file)
-        .map(|c| c.split_inclusive('\n').count())
-        .unwrap_or(0);
-    span.classify(total_lines)
-}
-
-/// Per-request context for applying a bloat-guard outcome.
-struct GuardContext<'a> {
-    state: &'a ServerState,
-    entry: Option<&'a WorkspaceEntry>,
-    file: &'a Path,
-    range_str: &'a str,
-    raw_len: u64,
-}
-
-fn log_guard_warning(ctx: &GuardContext<'_>, msg: &str) {
-    tracing::warn!("{}", msg);
-    let file_log = format!("[WARN] {}", msg);
-    ctx.state.log_manager.log_daemon(&file_log);
-    if let Some(ws) = ctx.entry {
-        ws.logger.log(&file_log);
+    if is_full_read == Some(true) && total_lines.is_none() {
+        return ReadCoverage::FullFile;
     }
-}
-
-/// Applies bloat-guard telemetry and logging based on the degradation outcome.
-///
-/// Returns `(delivered_len, action_label)`.
-///
-/// # Delivered Length Semantics
-/// For `Full` and `CallGraphPruned`, `delivered_len` is the exact byte length of the
-/// generated markdown payload. For `Dropped`, `delivered_len` is set equal to `raw_len`
-/// (representing that only the agent's raw read was consumed, with zero advisory bloat),
-/// ensuring token reduction calculations yield 0% rather than negative bloat.
-fn apply_guard_outcome(
-    ctx: &GuardContext<'_>,
-    outcome: &cortx_distill::bundle::BudgetedAdvisory,
-) -> (u64, &'static str) {
-    match outcome.stage {
-        cortx_distill::bundle::BudgetStage::Full => {
-            ctx.state.telemetry.record_submission();
-            if let Some(ws) = ctx.entry {
-                ws.record_submission();
-            }
-            (outcome.markdown.len() as u64, "PostReadHook served (full)")
-        }
-        cortx_distill::bundle::BudgetStage::CallGraphPruned => {
-            ctx.state.telemetry.record_submission();
-            ctx.state.telemetry.record_callgraph_drop();
-            if let Some(ws) = ctx.entry {
-                ws.record_submission();
-                ws.record_callgraph_drop();
-            }
-            let full_len = outcome.full_len.unwrap_or(outcome.pruned_len);
-            let reduction = if ctx.raw_len > 0 {
-                ((ctx.raw_len as f64 - outcome.pruned_len as f64) / ctx.raw_len as f64) * 100.0
-            } else {
-                0.0
-            };
-            let warn_msg = format!(
-                "PostReadHook pruned call graph: bundle ({} B) >= read request ({} B), retained skeleton ({} B, {:.1}% reduction) for '{}'{}",
-                full_len,
-                ctx.raw_len,
-                outcome.pruned_len,
-                reduction,
-                ctx.file.display(),
-                ctx.range_str
-            );
-            log_guard_warning(ctx, &warn_msg);
-            (
-                outcome.markdown.len() as u64,
-                "PostReadHook served (pruned call graph)",
-            )
-        }
-        cortx_distill::bundle::BudgetStage::Dropped => {
-            ctx.state.telemetry.record_ast_drop();
-            if let Some(ws) = ctx.entry {
-                ws.record_ast_drop();
-            }
-            let warn_msg = format!(
-                "PostReadHook dropped all advisory context: skeleton ({} B) >= read request ({} B) for '{}'{}",
-                outcome.pruned_len,
-                ctx.raw_len,
-                ctx.file.display(),
-                ctx.range_str
-            );
-            log_guard_warning(ctx, &warn_msg);
-            (ctx.raw_len, "PostReadHook skipped (micro-read < skeleton)")
-        }
-    }
+    cortx_core::classify_read_coverage(span, total_lines, raw_bytes, env)
 }
 
 fn format_range(start: Option<usize>, end: Option<usize>) -> String {
@@ -480,12 +412,116 @@ async fn handle_post_read_request(
     state: &ServerState,
 ) -> DaemonResponse {
     let file = params.file;
-    let read_kind = classify_read(&params, file);
-    state.telemetry.record_read_kind(read_kind);
+    let env = cortx_core::span::detect_budget_env(|k| std::env::var(k).ok());
+    let span = ReadSpan {
+        start_line: params.start_line,
+        end_line: params.end_line,
+        vendor: params.vendor,
+        ..Default::default()
+    };
 
+    let initial_coverage = classify_coverage(
+        &span,
+        params.total_lines,
+        params.raw_read_bytes,
+        params.is_full_read,
+        params.read_kind,
+        &env,
+    );
+
+    if initial_coverage == ReadCoverage::Micro {
+        let entry = state.registry.get(file).await;
+        if let Some(ref ws) = entry {
+            ws.record_read(ReadKind::Micro);
+            ws.record_omitted_micro_read();
+        }
+        state.telemetry.record_read_kind(ReadKind::Micro);
+        state
+            .telemetry
+            .omitted_micro_reads
+            .fetch_add(1, Ordering::Relaxed);
+
+        let raw_len = params.raw_read_bytes.unwrap_or(0);
+        state.telemetry.record_hook_metrics(raw_len, 0);
+        let elapsed_us = req_start.elapsed().as_micros();
+        let range_str = format_range(params.start_line, params.end_line);
+        let log_msg = format!(
+            "[MICRO] PostReadHook skipped (micro-read): '{}'{} | raw: {} B | delivered: 0 B | latency: {:.1}ms",
+            file.display(),
+            range_str,
+            raw_len,
+            elapsed_us as f64 / 1000.0,
+        );
+        state.log_manager.log_daemon(&log_msg);
+        if let Some(ref ws) = entry {
+            ws.logger.log(&log_msg);
+        }
+
+        return DaemonResponse::AdvisoryContext {
+            file: file.display().to_string(),
+            advisory_block: String::new(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+    }
+
+    execute_macro_post_read(params, span, env, req_start, state).await
+}
+
+fn record_packed_disposition_telemetry(
+    packed: &cortx_distill::bundle::PackedAdvisory,
+    state: &ServerState,
+    entry: Option<&WorkspaceEntry>,
+) {
+    match packed.disposition {
+        AdvisoryDisposition::OmittedMicro => {
+            state
+                .telemetry
+                .omitted_micro_reads
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(ws) = entry {
+                ws.record_omitted_micro_read();
+            }
+        }
+        AdvisoryDisposition::FullReadNoSkeleton => {
+            state
+                .telemetry
+                .omitted_full_read_skeletons
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(ws) = entry {
+                ws.record_omitted_full_read_skeleton();
+            }
+        }
+        AdvisoryDisposition::Trimmed => {
+            state
+                .telemetry
+                .trimmed_advisories
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(ws) = entry {
+                ws.record_trimmed_advisory();
+            }
+        }
+        AdvisoryDisposition::PartialMacroDelivered => {}
+    }
+
+    if !packed.markdown.is_empty() {
+        state.telemetry.record_submission();
+        if let Some(ws) = entry {
+            ws.record_submission();
+        }
+    }
+}
+
+async fn execute_macro_post_read(
+    params: PostReadParams<'_>,
+    span: ReadSpan,
+    env: cortx_core::span::ReadBudgetEnv,
+    req_start: std::time::Instant,
+    state: &ServerState,
+) -> DaemonResponse {
+    let file = params.file;
     let entry = match state.registry.get_or_init(file).await {
         Ok(e) => {
-            e.record_read(read_kind);
+            e.record_read(ReadKind::Macro);
             if let Some(ref watcher) = state.watcher_manager {
                 if !watcher.is_watching(&e.root) {
                     let _ = watcher.watch_workspace_with_config(
@@ -507,70 +543,112 @@ async fn handle_post_read_request(
             None
         }
     };
+    state.telemetry.record_read_kind(ReadKind::Macro);
 
-    let kind_tag = match read_kind {
-        ReadKind::Macro => "MACRO",
-        ReadKind::Micro => "MICRO",
-    };
+    let target_file = file.to_path_buf();
+    let ws_cfg = entry.as_ref().map(|e| e.config.clone());
+    let index_handle = entry
+        .as_ref()
+        .map(|e| Arc::clone(&e.index))
+        .unwrap_or_else(|| Arc::clone(&state.legacy_index));
+    let base_handle = entry
+        .as_ref()
+        .and_then(|e| e.base_index.as_ref().map(Arc::clone));
+    let shadowed_handle = entry.as_ref().map(|e| Arc::clone(&e.shadowed_files));
+    let params_raw_bytes = params.raw_read_bytes;
+    let params_total_lines = params.total_lines;
+    let params_is_full_read = params.is_full_read;
 
-    let raw_len = params
-        .raw_read_bytes
-        .unwrap_or_else(|| std::fs::metadata(file).map(|m| m.len()).unwrap_or(0));
-    let advisory_res = if let Some(ref ws) = entry {
-        if let Some(ref base) = ws.base_index {
-            let base_guard = base.read().await;
-            let ov_guard = ws.index.read().await;
-            execute_post_read_bundle_for_project(
-                file,
-                Some(&*base_guard),
-                Some(&*ov_guard),
-                Some(&ws.config),
+    let block_res = tokio::task::spawn_blocking(move || {
+        let source = std::fs::read_to_string(&target_file)
+            .map_err(|e| DaemonError::Watcher(e.to_string()))?;
+        let src_bytes = source.len() as u64;
+        let tot_lines = params_total_lines.unwrap_or_else(|| source.split_inclusive('\n').count());
+        let raw_bytes_for_calc = params_raw_bytes.unwrap_or(src_bytes);
+
+        let coverage = classify_coverage(
+            &span,
+            Some(tot_lines),
+            Some(raw_bytes_for_calc),
+            params_is_full_read,
+            None,
+            &env,
+        );
+
+        let base_guard = base_handle.as_ref().map(|b| b.blocking_read());
+        let idx_guard = index_handle.blocking_read();
+        let shadowed_guard = shadowed_handle.as_ref().map(|s| s.blocking_read());
+
+        let (base_ref, overlay_ref, shadow_ref) = if base_handle.is_some() {
+            (
+                base_guard.as_deref(),
+                Some(&*idx_guard),
+                shadowed_guard.as_deref(),
             )
         } else {
-            let guard = ws.index.read().await;
-            execute_post_read_bundle_for_project(file, Some(&*guard), None, Some(&ws.config))
-        }
-    } else {
-        let guard = state.legacy_index.read().await;
-        execute_post_read_bundle(file, Some(&*guard))
-    };
+            (Some(&*idx_guard), None, None)
+        };
 
-    match advisory_res {
-        Ok(bundle) => {
+        let view = OverlayView {
+            base: base_ref,
+            overlay: overlay_ref,
+            shadowed_files: shadow_ref,
+        };
+
+        let query = DistillQuery {
+            file_path: &target_file,
+            mode: DistillMode::Bundle,
+            coverage,
+            span: Some(span),
+            preloaded_source: Some(&source),
+            cross_boundary: true,
+            project_cfg: ws_cfg.as_ref(),
+        };
+
+        let bundle = execute_post_read_query(&query, view)?;
+        let packed = bundle.pack_for_hook(coverage);
+        Ok::<_, DaemonError>((packed, raw_bytes_for_calc, coverage))
+    })
+    .await;
+
+    match block_res {
+        Ok(Ok((packed, raw_len, coverage))) => {
+            let delivered_len = packed.markdown.len() as u64;
             let elapsed_us = req_start.elapsed().as_micros();
             let range_str = format_range(params.start_line, params.end_line);
 
-            let outcome = bundle.fit_to_budget(raw_len);
-            let ctx = GuardContext {
-                state,
-                entry: entry.as_deref(),
-                file,
-                range_str: &range_str,
-                raw_len,
-            };
-            let (delivered_len, action) = apply_guard_outcome(&ctx, &outcome);
+            record_packed_disposition_telemetry(&packed, state, entry.as_deref());
 
-            let pct = state.telemetry.record_reduction(raw_len, delivered_len);
+            state.telemetry.record_hook_metrics(raw_len, delivered_len);
+            let kind_tag = match coverage {
+                ReadCoverage::Micro => "MICRO",
+                ReadCoverage::FullFile => "FULL_FILE",
+                ReadCoverage::PartialMacro => "PARTIAL_MACRO",
+            };
+
             let log_msg = format!(
-                "[{kind_tag}] {action}: '{}'{range_str} | raw: {} B | delivered: {} B | reduction: {:.1}% | latency: {:.1}ms",
+                "[{kind_tag}] PostReadHook served ({:?}): '{}'{} | raw: {} B | delivered: {} B | latency: {:.1}ms",
+                packed.disposition,
                 file.display(),
+                range_str,
                 raw_len,
                 delivered_len,
-                pct,
                 elapsed_us as f64 / 1000.0,
             );
             state.log_manager.log_daemon(&log_msg);
             if let Some(ref ws) = entry {
                 ws.logger.log(&log_msg);
             }
+
             DaemonResponse::AdvisoryContext {
                 file: file.display().to_string(),
-                advisory_block: outcome.markdown,
+                advisory_block: packed.markdown,
+                protocol_version: PROTOCOL_VERSION,
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let err_msg = format!(
-                "[{kind_tag}] PostReadHook failed for '{}': {}",
+                "[MACRO] PostReadHook failed for '{}': {}",
                 file.display(),
                 e
             );
@@ -582,16 +660,31 @@ async fn handle_post_read_request(
                 message: e.to_string(),
             }
         }
+        Err(join_err) => {
+            let err_msg = format!(
+                "[MACRO] PostReadHook task panicked for '{}': {}",
+                file.display(),
+                join_err
+            );
+            state.log_manager.log_daemon(&err_msg);
+            DaemonResponse::Error { message: err_msg }
+        }
     }
 }
 
-async fn handle_distill_request(
-    file: &Path,
-    mode: cortx_core::model::DistillMode,
+struct DistillParams<'a> {
+    file: &'a Path,
+    mode: DistillMode,
     format: cortx_core::output::OutputFormat,
-    state: &ServerState,
-) -> DaemonResponse {
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    vendor: Option<AgentVendor>,
+    cross_boundary: bool,
+}
+
+async fn handle_distill_request(params: DistillParams<'_>, state: &ServerState) -> DaemonResponse {
     let req_start = std::time::Instant::now();
+    let file = params.file;
     let entry = match state.registry.get_or_init(file).await {
         Ok(e) => {
             if let Some(ref watcher) = state.watcher_manager {
@@ -617,39 +710,71 @@ async fn handle_distill_request(
     };
 
     let raw_len = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+    let span =
+        if params.start_line.is_some() || params.end_line.is_some() || params.vendor.is_some() {
+            Some(ReadSpan {
+                start_line: params.start_line,
+                end_line: params.end_line,
+                vendor: params.vendor,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+
+    let project_cfg = entry.as_ref().map(|e| &e.config);
+    let query = DistillQuery {
+        file_path: file,
+        mode: params.mode,
+        coverage: ReadCoverage::PartialMacro,
+        span,
+        preloaded_source: None,
+        cross_boundary: params.cross_boundary,
+        project_cfg,
+    };
+
     let distill_res = if let Some(ref ws) = entry {
         if let Some(ref base) = ws.base_index {
             let base_guard = base.read().await;
             let ov_guard = ws.index.read().await;
-            distill_target_for_project(
-                file,
-                mode,
-                Some(&*base_guard),
-                Some(&*ov_guard),
-                Some(&ws.config),
-            )
+            let shadowed_guard = ws.shadowed_files.read().await;
+            let view = OverlayView {
+                base: Some(&*base_guard),
+                overlay: Some(&*ov_guard),
+                shadowed_files: Some(&*shadowed_guard),
+            };
+            cortx_distill::distill_with_query(&query, view)
         } else {
             let guard = ws.index.read().await;
-            distill_target_for_project(file, mode, Some(&*guard), None, Some(&ws.config))
+            let view = OverlayView {
+                base: Some(&*guard),
+                overlay: None,
+                shadowed_files: None,
+            };
+            cortx_distill::distill_with_query(&query, view)
         }
     } else {
         let guard = state.legacy_index.read().await;
-        distill_target(file, mode, Some(&*guard))
+        let view = OverlayView {
+            base: Some(&*guard),
+            overlay: None,
+            shadowed_files: None,
+        };
+        cortx_distill::distill_with_query(&query, view)
     };
 
     match distill_res {
         Ok(bundle) => {
             let elapsed_us = req_start.elapsed().as_micros();
-            let content = bundle.format_with(format).unwrap_or_default();
+            let content = bundle.format_with(params.format).unwrap_or_default();
             let delivered_len = content.len() as u64;
-            let pct = state.telemetry.record_reduction(raw_len, delivered_len);
+            state.telemetry.record_hook_metrics(raw_len, delivered_len);
             let log_msg = format!(
-                "Distill served: '{}' (mode: {:?}) | raw: {} B | delivered: {} B | reduction: {:.1}% | latency: {:.1}ms",
+                "Distill served: '{}' (mode: {:?}) | raw: {} B | delivered: {} B | latency: {:.1}ms",
                 file.display(),
-                mode,
+                params.mode,
                 raw_len,
                 delivered_len,
-                pct,
                 elapsed_us as f64 / 1000.0,
             );
             state.log_manager.log_daemon(&log_msg);
@@ -680,17 +805,23 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
     let mut agg_call_edges = 0;
     let mut agg_contracts = 0;
     let mut agg_routes = 0;
+    let mut agg_parse_fallbacks = 0;
 
     for entry in &entries {
-        let (metrics, mem_mb) = {
+        let (metrics, mem_mb, parse_fallbacks) = {
             let guard = entry.index.read().await;
-            (guard.metrics(), guard.estimate_memory_mb())
+            (
+                guard.metrics(),
+                guard.estimate_memory_mb(),
+                guard.parse_fallbacks,
+            )
         };
         agg_files += metrics.distinct_files_count;
         agg_symbols += metrics.total_symbols_count;
         agg_call_edges += metrics.total_call_edges_count;
         agg_contracts += metrics.total_contracts_count;
         agg_routes += metrics.total_routes_count;
+        agg_parse_fallbacks += parse_fallbacks as u64;
 
         ws_summaries.push(WorkspaceSummary {
             root: entry.root.clone(),
@@ -708,6 +839,10 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
             ast_drops: entry.ast_drops(),
             macro_reads: entry.macro_reads(),
             micro_reads: entry.micro_reads(),
+            omitted_micro_reads: entry.omitted_micro_reads(),
+            omitted_full_read_skeletons: entry.omitted_full_read_skeletons(),
+            trimmed_advisories: entry.trimmed_advisories(),
+            parse_fallbacks: parse_fallbacks as u64,
         });
     }
 
@@ -719,6 +854,7 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
         agg_call_edges = m.total_call_edges_count;
         agg_contracts = m.total_contracts_count;
         agg_routes = m.total_routes_count;
+        agg_parse_fallbacks = guard.parse_fallbacks as u64;
     }
 
     let daemon_mode = if state.options.workspace_root.as_os_str().is_empty() {
@@ -727,9 +863,11 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
         "Isolated Workspace".to_string()
     };
 
-    let (hooks, raw, delivered, saved, pct, est_tokens) = state.telemetry.snapshot();
+    let (hooks, raw, delivered) = state.telemetry.snapshot();
     let supp_tokens = delivered / cortx_core::span::EST_BYTES_PER_TOKEN;
     DaemonStatusInfo {
+        protocol_version: PROTOCOL_VERSION,
+        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
         uptime_secs: state.start_time.elapsed().as_secs(),
         socket_path: state.options.socket_path.clone(),
@@ -753,11 +891,15 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
         ast_drops: state.telemetry.ast_drops.load(Ordering::Relaxed),
         raw_bytes_served: raw,
         delivered_bytes_served: delivered,
-        bytes_saved: saved,
-        token_reduction_pct: pct,
-        est_tokens_saved: est_tokens,
         macro_reads: state.telemetry.macro_reads.load(Ordering::Relaxed),
         micro_reads: state.telemetry.micro_reads.load(Ordering::Relaxed),
+        omitted_micro_reads: state.telemetry.omitted_micro_reads.load(Ordering::Relaxed),
+        omitted_full_read_skeletons: state
+            .telemetry
+            .omitted_full_read_skeletons
+            .load(Ordering::Relaxed),
+        trimmed_advisories: state.telemetry.trimmed_advisories.load(Ordering::Relaxed),
+        parse_fallbacks: agg_parse_fallbacks,
         supplemental_context_bytes: delivered,
         supplemental_context_tokens: supp_tokens,
     }
@@ -791,6 +933,9 @@ async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Resul
                 end_line,
                 raw_read_bytes,
                 read_kind,
+                total_lines,
+                vendor,
+                is_full_read,
             } => {
                 let params = PostReadParams {
                     file: &file,
@@ -798,19 +943,39 @@ async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Resul
                     end_line,
                     raw_read_bytes,
                     read_kind,
+                    total_lines,
+                    vendor,
+                    is_full_read,
                 };
                 let resp = handle_post_read_request(params, req_start, &state).await;
                 write_message(&mut stream, &resp).await?;
             }
-            DaemonRequest::Distill { file, mode, format } => {
-                let resp = handle_distill_request(&file, mode, format, &state).await;
+            DaemonRequest::Distill {
+                file,
+                mode,
+                format,
+                start_line,
+                end_line,
+                vendor,
+                cross_boundary,
+            } => {
+                let params = DistillParams {
+                    file: &file,
+                    mode,
+                    format,
+                    start_line,
+                    end_line,
+                    vendor,
+                    cross_boundary,
+                };
+                let resp = handle_distill_request(params, &state).await;
                 write_message(&mut stream, &resp).await?;
             }
             DaemonRequest::Shutdown => {
-                let (hooks, raw, delivered, saved, pct, est_tokens) = state.telemetry.snapshot();
+                let (hooks, raw, delivered) = state.telemetry.snapshot();
                 state.log_manager.log_daemon(&format!(
-                    "Daemon stopping: hooks_served={}, raw_bytes={}, delivered_bytes={}, bytes_saved={} ({:.1}%), est_tokens_saved={}",
-                    hooks, raw, delivered, saved, pct, est_tokens
+                    "Daemon stopping: hooks_served={}, raw_bytes={}, delivered_bytes={}",
+                    hooks, raw, delivered
                 ));
                 write_message(&mut stream, &DaemonResponse::ShutdownAck).await?;
                 state.token.cancel();
@@ -826,22 +991,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_server_telemetry_reduction_and_bounds() {
+    fn test_server_telemetry_metrics() {
         let telemetry = ServerTelemetry::default();
-        let pct = telemetry.record_reduction(1000, 200);
-        assert!((pct - 80.0).abs() < 0.001);
+        telemetry.record_hook_metrics(1000, 200);
+        telemetry.record_hook_metrics(50, 100);
 
-        // Edge case: delivered > raw reflects negative reduction and deducts from net savings
-        let pct2 = telemetry.record_reduction(50, 100);
-        assert!((pct2 - (-100.0)).abs() < 0.001);
-
-        let (hooks, raw, delivered, saved, cumulative_pct, tokens) = telemetry.snapshot();
+        let (hooks, raw, delivered) = telemetry.snapshot();
         assert_eq!(hooks, 2);
         assert_eq!(raw, 1050);
         assert_eq!(delivered, 300);
-        assert_eq!(saved, 750);
-        assert!((cumulative_pct - (750.0 / 1050.0 * 100.0)).abs() < 0.001);
-        assert_eq!(tokens, 187);
     }
 
     #[tokio::test]
@@ -853,7 +1011,7 @@ mod tests {
             let t = Arc::clone(&telemetry);
             handles.push(tokio::spawn(async move {
                 for _ in 0..100 {
-                    t.record_reduction(100, 20);
+                    t.record_hook_metrics(100, 20);
                 }
             }));
         }
@@ -862,13 +1020,10 @@ mod tests {
             h.await.unwrap();
         }
 
-        let (hooks, raw, delivered, saved, pct, tokens) = telemetry.snapshot();
+        let (hooks, raw, delivered) = telemetry.snapshot();
         assert_eq!(hooks, 1600);
         assert_eq!(raw, 160_000);
         assert_eq!(delivered, 32_000);
-        assert_eq!(saved, 128_000);
-        assert!((pct - 80.0).abs() < 0.001);
-        assert_eq!(tokens, 32_000);
     }
 
     #[tokio::test]
@@ -879,6 +1034,9 @@ mod tests {
         assert_eq!(telemetry.ast_drops.load(Ordering::Relaxed), 0);
         assert_eq!(telemetry.macro_reads(), 0);
         assert_eq!(telemetry.micro_reads(), 0);
+        assert_eq!(telemetry.omitted_micro_reads(), 0);
+        assert_eq!(telemetry.omitted_full_read_skeletons(), 0);
+        assert_eq!(telemetry.trimmed_advisories(), 0);
 
         telemetry.record_submission();
         telemetry.record_submission();
@@ -887,12 +1045,22 @@ mod tests {
         telemetry.record_read_kind(ReadKind::Macro);
         telemetry.record_read_kind(ReadKind::Micro);
         telemetry.record_read_kind(ReadKind::Micro);
+        telemetry
+            .omitted_micro_reads
+            .fetch_add(1, Ordering::Relaxed);
+        telemetry
+            .omitted_full_read_skeletons
+            .fetch_add(1, Ordering::Relaxed);
+        telemetry.trimmed_advisories.fetch_add(1, Ordering::Relaxed);
 
         assert_eq!(telemetry.submissions.load(Ordering::Relaxed), 2);
         assert_eq!(telemetry.callgraph_drops.load(Ordering::Relaxed), 1);
         assert_eq!(telemetry.ast_drops.load(Ordering::Relaxed), 1);
         assert_eq!(telemetry.macro_reads(), 1);
         assert_eq!(telemetry.micro_reads(), 2);
+        assert_eq!(telemetry.omitted_micro_reads(), 1);
+        assert_eq!(telemetry.omitted_full_read_skeletons(), 1);
+        assert_eq!(telemetry.trimmed_advisories(), 1);
     }
 
     #[tokio::test]
@@ -914,21 +1082,48 @@ mod tests {
         let src_file = dir.path().join("main.rs");
         let mut file_content = String::new();
         for i in 0..200 {
-            file_content.push_str(&format!("fn f{}() {{}}\n", i));
+            file_content.push_str(&format!("pub fn f{}() {{}}\n", i));
         }
         std::fs::write(&src_file, &file_content).unwrap();
 
-        // 1. Unbounded read -> Macro read
+        // 1. PartialMacro read (e.g. lines 1..160 of 200 lines, > 150 lines) -> PartialMacro read delivering unread outline
         let p_macro = PostReadParams {
             file: &src_file,
-            start_line: None,
-            end_line: None,
+            start_line: Some(1),
+            end_line: Some(160),
             raw_read_bytes: Some(file_content.len() as u64),
             read_kind: None,
+            total_lines: Some(200),
+            vendor: None,
+            is_full_read: None,
         };
-        let _ = handle_post_read_request(p_macro, std::time::Instant::now(), &state).await;
+        let resp_macro = handle_post_read_request(p_macro, std::time::Instant::now(), &state).await;
+        match resp_macro {
+            DaemonResponse::AdvisoryContext {
+                advisory_block,
+                protocol_version,
+                ..
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert!(
+                    !advisory_block.is_empty(),
+                    "PartialMacro should deliver unread outline"
+                );
+                assert!(
+                    advisory_block.contains("f160")
+                        || advisory_block.contains("f161")
+                        || advisory_block.contains("f199")
+                );
+            }
+            other => panic!("expected AdvisoryContext, got {:?}", other),
+        }
         assert_eq!(state.telemetry.macro_reads(), 1);
         assert_eq!(state.telemetry.micro_reads(), 0);
+        let delivered_after_macro = state
+            .telemetry
+            .delivered_bytes_served
+            .load(Ordering::Relaxed);
+        assert!(delivered_after_macro > 0);
 
         // 2. Bounded read (lines 10..40, 31 lines <= 150) -> Micro read
         let p_micro = PostReadParams {
@@ -937,10 +1132,33 @@ mod tests {
             end_line: Some(40),
             raw_read_bytes: Some(500),
             read_kind: None,
+            total_lines: Some(200),
+            vendor: None,
+            is_full_read: None,
         };
-        let _ = handle_post_read_request(p_micro, std::time::Instant::now(), &state).await;
+        let resp_micro = handle_post_read_request(p_micro, std::time::Instant::now(), &state).await;
+        match resp_micro {
+            DaemonResponse::AdvisoryContext {
+                advisory_block,
+                protocol_version,
+                ..
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert_eq!(advisory_block, "");
+            }
+            other => panic!("expected AdvisoryContext, got {:?}", other),
+        }
         assert_eq!(state.telemetry.macro_reads(), 1);
         assert_eq!(state.telemetry.micro_reads(), 1);
+        assert_eq!(state.telemetry.omitted_micro_reads(), 1);
+        // Delivered bytes served must be strictly unchanged on omitted micro-reads!
+        assert_eq!(
+            state
+                .telemetry
+                .delivered_bytes_served
+                .load(Ordering::Relaxed),
+            delivered_after_macro
+        );
 
         // 3. Explicit read_kind override
         let p_explicit = PostReadParams {
@@ -949,130 +1167,124 @@ mod tests {
             end_line: None,
             raw_read_bytes: Some(500),
             read_kind: Some(ReadKind::Micro),
+            total_lines: None,
+            vendor: None,
+            is_full_read: None,
         };
-        let _ = handle_post_read_request(p_explicit, std::time::Instant::now(), &state).await;
+        let resp_explicit =
+            handle_post_read_request(p_explicit, std::time::Instant::now(), &state).await;
+        match resp_explicit {
+            DaemonResponse::AdvisoryContext {
+                advisory_block,
+                protocol_version,
+                ..
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert_eq!(advisory_block, "");
+            }
+            other => panic!("expected AdvisoryContext, got {:?}", other),
+        }
         assert_eq!(state.telemetry.macro_reads(), 1);
         assert_eq!(state.telemetry.micro_reads(), 2);
+        assert_eq!(state.telemetry.omitted_micro_reads(), 2);
+        assert_eq!(
+            state
+                .telemetry
+                .delivered_bytes_served
+                .load(Ordering::Relaxed),
+            delivered_after_macro
+        );
+
+        // 4. Unbounded full-file read on standalone file without callers/contracts -> FullFile read with omitted skeleton
+        let p_full = PostReadParams {
+            file: &src_file,
+            start_line: None,
+            end_line: None,
+            raw_read_bytes: Some(file_content.len() as u64),
+            read_kind: None,
+            total_lines: Some(200),
+            vendor: None,
+            is_full_read: Some(true),
+        };
+        let resp_full = handle_post_read_request(p_full, std::time::Instant::now(), &state).await;
+        match resp_full {
+            DaemonResponse::AdvisoryContext {
+                advisory_block,
+                protocol_version,
+                ..
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert_eq!(advisory_block, "");
+            }
+            other => panic!("expected AdvisoryContext, got {:?}", other),
+        }
+        assert_eq!(state.telemetry.macro_reads(), 2);
+        assert_eq!(state.telemetry.omitted_full_read_skeletons(), 1);
 
         // Check DaemonStatusInfo
         let status = build_status_response(&state).await;
-        assert_eq!(status.macro_reads, 1);
+        assert_eq!(status.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(status.macro_reads, 2);
         assert_eq!(status.micro_reads, 2);
+        assert_eq!(status.omitted_micro_reads, 2);
+        assert_eq!(status.omitted_full_read_skeletons, 1);
         assert!(status.supplemental_context_bytes > 0);
         assert_eq!(
             status.supplemental_context_tokens,
             status.supplemental_context_bytes / cortx_core::span::EST_BYTES_PER_TOKEN
         );
         assert_eq!(status.workspaces.len(), 1);
-        assert_eq!(status.workspaces[0].macro_reads, 1);
+        assert_eq!(status.workspaces[0].macro_reads, 2);
         assert_eq!(status.workspaces[0].micro_reads, 2);
+        assert_eq!(status.workspaces[0].omitted_micro_reads, 2);
+        assert_eq!(status.workspaces[0].omitted_full_read_skeletons, 1);
     }
 
     #[tokio::test]
-    async fn test_apply_guard_outcome_stages() {
+    async fn test_toctou_safe_socket_bind() {
         let dir = tempfile::tempdir().unwrap();
-        let log_dir = dir.path().join("logs");
-        let opts = ServerOptions {
-            socket_path: dir.path().join("test.sock"),
-            workspace_root: dir.path().to_path_buf(),
-            log_dir: Some(log_dir),
-            ..Default::default()
-        };
+        let sock_path = dir.path().join("test_bind.sock");
+
+        // Stale dead socket file removal: create an inactive dummy socket file
+        std::fs::write(&sock_path, b"dead").unwrap();
+
         let index = Arc::new(RwLock::new(SymbolIndex::new()));
         let token = CancellationToken::new();
-        let state = init_server_state(opts, index, token, std::time::Instant::now())
-            .await
-            .expect("init server state");
+        let token_clone = token.clone();
+        let sock_path_clone = sock_path.clone();
 
-        let bundle = cortx_distill::DistillBundle {
-            target: "src/test.rs".to_string(),
-            skeleton: "pub fn small() {}".to_string(),
-            contracts: vec![],
-            callers: vec![cortx_distill::CallEdge {
-                caller: "caller_fn".into(),
-                callee: "small".into(),
-                file: "src/caller.rs".into(),
-            }],
-            callees: vec![],
-            token_reduction_pct: 50.0,
-            cross_boundary: None,
+        let server_opts = ServerOptions {
+            socket_path: sock_path_clone.clone(),
+            workspace_root: dir.path().to_path_buf(),
+            ..Default::default()
         };
 
-        let full_md = bundle.format_markdown();
-        let pruned_md = bundle.without_call_graph().format_markdown();
-        let full_len = full_md.len() as u64;
-        let pruned_len = pruned_md.len() as u64;
-        assert!(pruned_len < full_len);
+        // run_server_with_options should clean up dead socket and bind successfully
+        let server_handle =
+            tokio::spawn(
+                async move { run_server_with_options(server_opts, index, token_clone).await },
+            );
 
-        let test_file = Path::new("src/test.rs");
+        // Give it a brief moment to bind
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(sock_path.exists());
 
-        // Stage 0: raw_len > full_len -> Deliver full bundle
-        let raw0 = full_len + 50;
-        let outcome0 = bundle.fit_to_budget(raw0);
-        let ctx0 = GuardContext {
-            state: &state,
-            entry: None,
-            file: test_file,
-            range_str: "",
-            raw_len: raw0,
+        // Probe running daemon: ping should succeed
+        assert!(probe_active_socket(&sock_path).await);
+
+        // Attempting a second bind on active socket fails with SocketAlreadyBound
+        let index2 = Arc::new(RwLock::new(SymbolIndex::new()));
+        let token2 = CancellationToken::new();
+        let server_opts2 = ServerOptions {
+            socket_path: sock_path_clone,
+            workspace_root: dir.path().to_path_buf(),
+            ..Default::default()
         };
-        let (out_len, action) = apply_guard_outcome(&ctx0, &outcome0);
-        assert_eq!(action, "PostReadHook served (full)");
-        assert_eq!(out_len, full_len);
-        assert_eq!(outcome0.markdown, full_md);
-        assert_eq!(state.telemetry.submissions.load(Ordering::Relaxed), 1);
-        assert_eq!(state.telemetry.callgraph_drops.load(Ordering::Relaxed), 0);
-        assert_eq!(state.telemetry.ast_drops.load(Ordering::Relaxed), 0);
+        let err = run_server_with_options(server_opts2, index2, token2).await;
+        assert!(matches!(err, Err(DaemonError::SocketAlreadyBound(_))));
 
-        // Stage 1: pruned_len < raw_len <= full_len -> Deliver pruned skeleton
-        let target_raw = pruned_len + 1;
-        let outcome1 = bundle.fit_to_budget(target_raw);
-        let ctx1 = GuardContext {
-            state: &state,
-            entry: None,
-            file: test_file,
-            range_str: "",
-            raw_len: target_raw,
-        };
-        let (out_len, action) = apply_guard_outcome(&ctx1, &outcome1);
-        assert_eq!(action, "PostReadHook served (pruned call graph)");
-        assert_eq!(out_len, pruned_len);
-        assert_eq!(outcome1.markdown, pruned_md);
-        assert_eq!(state.telemetry.submissions.load(Ordering::Relaxed), 2);
-        assert_eq!(state.telemetry.callgraph_drops.load(Ordering::Relaxed), 1);
-        assert_eq!(state.telemetry.ast_drops.load(Ordering::Relaxed), 0);
-
-        // Stage 2: raw_len <= pruned_len on bounded micro-read -> Total drop (empty string)
-        let raw2 = pruned_len - 1;
-        let outcome2 = bundle.fit_to_budget(raw2);
-        let ctx2 = GuardContext {
-            state: &state,
-            entry: None,
-            file: test_file,
-            range_str: " (lines 1..5)",
-            raw_len: raw2,
-        };
-        let (out_len, action) = apply_guard_outcome(&ctx2, &outcome2);
-        assert_eq!(action, "PostReadHook skipped (micro-read < skeleton)");
-        assert_eq!(out_len, raw2);
-        assert!(outcome2.markdown.is_empty());
-        assert_eq!(state.telemetry.submissions.load(Ordering::Relaxed), 2);
-        assert_eq!(state.telemetry.callgraph_drops.load(Ordering::Relaxed), 1);
-        assert_eq!(state.telemetry.ast_drops.load(Ordering::Relaxed), 1);
-
-        // Explicit 0-byte budget -> Total drop
-        let outcome_zero = bundle.fit_to_budget(0);
-        let ctx_zero = GuardContext {
-            state: &state,
-            entry: None,
-            file: test_file,
-            range_str: "",
-            raw_len: 0,
-        };
-        let (out_len, action) = apply_guard_outcome(&ctx_zero, &outcome_zero);
-        assert_eq!(action, "PostReadHook skipped (micro-read < skeleton)");
-        assert_eq!(out_len, 0);
-        assert!(outcome_zero.markdown.is_empty());
-        assert_eq!(state.telemetry.ast_drops.load(Ordering::Relaxed), 2);
+        // Shutdown cleanly
+        token.cancel();
+        let _ = server_handle.await;
     }
 }

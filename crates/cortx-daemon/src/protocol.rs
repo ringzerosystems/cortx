@@ -1,12 +1,16 @@
 //! Length-prefixed IPC messaging protocol for agent sidecar communication.
 
 use crate::error::DaemonError;
+use cortx_core::AgentVendor;
 use cortx_core::ReadKind;
 use cortx_core::model::DistillMode;
 use cortx_core::output::OutputFormat;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+/// Wire protocol version for daemon IPC.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// IPC request sent from agent tool hook or CLI client to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +35,15 @@ pub enum DaemonRequest {
         /// Optional pre-classified read kind (Micro vs Macro read).
         #[serde(default)]
         read_kind: Option<ReadKind>,
+        /// Optional total line count of target file.
+        #[serde(default)]
+        total_lines: Option<usize>,
+        /// Optional agent vendor.
+        #[serde(default)]
+        vendor: Option<AgentVendor>,
+        /// Optional flag indicating whether this is an unbounded or full-file read.
+        #[serde(default)]
+        is_full_read: Option<bool>,
     },
     /// Request AST context distillation for file.
     Distill {
@@ -40,6 +53,18 @@ pub enum DaemonRequest {
         mode: DistillMode,
         /// Desired output format.
         format: OutputFormat,
+        /// Optional 1-indexed start line.
+        #[serde(default)]
+        start_line: Option<usize>,
+        /// Optional 1-indexed inclusive end line.
+        #[serde(default)]
+        end_line: Option<usize>,
+        /// Optional agent vendor.
+        #[serde(default)]
+        vendor: Option<AgentVendor>,
+        /// Enable cross-boundary HTTP route and model correlation.
+        #[serde(default)]
+        cross_boundary: bool,
     },
     /// Request graceful shutdown of daemon.
     Shutdown,
@@ -85,11 +110,29 @@ pub struct WorkspaceSummary {
     /// Total micro reads (<= 150 lines bounded) served for this workspace.
     #[serde(default)]
     pub micro_reads: u64,
+    /// Total micro reads with omitted advisory output for this workspace.
+    #[serde(default)]
+    pub omitted_micro_reads: u64,
+    /// Total full-file reads with omitted self-skeletons for this workspace.
+    #[serde(default)]
+    pub omitted_full_read_skeletons: u64,
+    /// Total advisories trimmed to wire character budget for this workspace.
+    #[serde(default)]
+    pub trimmed_advisories: u64,
+    /// Total times parser fell back to cached/empty facts on syntax error for this workspace.
+    #[serde(default)]
+    pub parse_fallbacks: u64,
 }
 
 /// Detailed runtime statistics and index telemetry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DaemonStatusInfo {
+    /// Wire protocol version.
+    #[serde(default)]
+    pub protocol_version: u32,
+    /// Daemon package version.
+    #[serde(default)]
+    pub daemon_version: String,
     /// Process ID of the running daemon.
     pub pid: u32,
     /// Daemon process uptime in seconds.
@@ -140,7 +183,7 @@ pub struct DaemonStatusInfo {
     #[serde(default)]
     pub watcher_active: bool,
 
-    // --- Context Bloat Reduction Telemetry ---
+    // --- Advisory Hook Telemetry ---
     /// Total number of advisory tool hook requests served since daemon startup.
     #[serde(default)]
     pub hooks_served: u64,
@@ -159,21 +202,24 @@ pub struct DaemonStatusInfo {
     /// Total advisory context bytes emitted (skeletons + contracts).
     #[serde(default)]
     pub delivered_bytes_served: u64,
-    /// Cumulative raw bytes saved (raw - delivered, clamped >= 0).
-    #[serde(default)]
-    pub bytes_saved: u64,
-    /// Overall context reduction percentage across all served requests.
-    #[serde(default)]
-    pub token_reduction_pct: f64,
-    /// Estimated LLM tokens saved across all requests (~4 bytes per token).
-    #[serde(default)]
-    pub est_tokens_saved: u64,
     /// Total macro reads served across all workspaces.
     #[serde(default)]
     pub macro_reads: u64,
     /// Total micro reads served across all workspaces.
     #[serde(default)]
     pub micro_reads: u64,
+    /// Total micro reads with omitted advisory output across all workspaces.
+    #[serde(default)]
+    pub omitted_micro_reads: u64,
+    /// Total full-file reads with omitted self-skeletons across all workspaces.
+    #[serde(default)]
+    pub omitted_full_read_skeletons: u64,
+    /// Total advisories trimmed to wire character budget across all workspaces.
+    #[serde(default)]
+    pub trimmed_advisories: u64,
+    /// Total times parser fell back to cached/empty facts on syntax error across all workspaces.
+    #[serde(default)]
+    pub parse_fallbacks: u64,
     /// Total supplemental context delivered in bytes across all requests.
     #[serde(default)]
     pub supplemental_context_bytes: u64,
@@ -196,6 +242,9 @@ pub enum DaemonResponse {
         file: String,
         /// Advisory markdown block.
         advisory_block: String,
+        /// Wire protocol version.
+        #[serde(default)]
+        protocol_version: u32,
     },
     /// Distillation output content.
     DistillResult {
@@ -276,6 +325,8 @@ mod tests {
     async fn test_protocol_status_response_framing() {
         let mut buf = Vec::new();
         let status = DaemonStatusInfo {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_version: "0.1.0".to_string(),
             pid: 12345,
             uptime_secs: 42,
             socket_path: PathBuf::from("/tmp/cortx-test.sock"),
@@ -301,6 +352,10 @@ mod tests {
                 ast_drops: 0,
                 macro_reads: 1,
                 micro_reads: 2,
+                omitted_micro_reads: 1,
+                omitted_full_read_skeletons: 2,
+                trimmed_advisories: 0,
+                parse_fallbacks: 0,
             }],
             workspace_root: PathBuf::from("/home/user/project"),
             indexed_files: 10,
@@ -315,11 +370,12 @@ mod tests {
             ast_drops: 0,
             raw_bytes_served: 10000,
             delivered_bytes_served: 2000,
-            bytes_saved: 8000,
-            token_reduction_pct: 80.0,
-            est_tokens_saved: 2000,
             macro_reads: 1,
             micro_reads: 2,
+            omitted_micro_reads: 1,
+            omitted_full_read_skeletons: 2,
+            trimmed_advisories: 0,
+            parse_fallbacks: 0,
             supplemental_context_bytes: 2000,
             supplemental_context_tokens: 500,
         };
@@ -352,6 +408,8 @@ mod tests {
         }"#;
 
         let decoded: DaemonStatusInfo = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(decoded.protocol_version, 0);
+        assert_eq!(decoded.daemon_version, "");
         assert_eq!(decoded.pid, 12345);
         assert_eq!(decoded.daemon_mode, "");
         assert_eq!(decoded.config_path, None);
@@ -366,11 +424,12 @@ mod tests {
         assert_eq!(decoded.ast_drops, 0);
         assert_eq!(decoded.raw_bytes_served, 0);
         assert_eq!(decoded.delivered_bytes_served, 0);
-        assert_eq!(decoded.bytes_saved, 0);
-        assert_eq!(decoded.token_reduction_pct, 0.0);
-        assert_eq!(decoded.est_tokens_saved, 0);
         assert_eq!(decoded.macro_reads, 0);
         assert_eq!(decoded.micro_reads, 0);
+        assert_eq!(decoded.omitted_micro_reads, 0);
+        assert_eq!(decoded.omitted_full_read_skeletons, 0);
+        assert_eq!(decoded.trimmed_advisories, 0);
+        assert_eq!(decoded.parse_fallbacks, 0);
         assert_eq!(decoded.supplemental_context_bytes, 0);
         assert_eq!(decoded.supplemental_context_tokens, 0);
     }
@@ -394,6 +453,120 @@ mod tests {
         assert_eq!(decoded.ast_drops, 0);
         assert_eq!(decoded.macro_reads, 0);
         assert_eq!(decoded.micro_reads, 0);
+        assert_eq!(decoded.omitted_micro_reads, 0);
+        assert_eq!(decoded.omitted_full_read_skeletons, 0);
+        assert_eq!(decoded.trimmed_advisories, 0);
+        assert_eq!(decoded.parse_fallbacks, 0);
+    }
+
+    #[test]
+    fn test_protocol_advisory_context_backward_compatibility() {
+        let legacy_json =
+            r##"{"AdvisoryContext":{"file":"/tmp/test.rs","advisory_block":"# context"}}"##;
+        let decoded: DaemonResponse = serde_json::from_str(legacy_json).unwrap();
+        match decoded {
+            DaemonResponse::AdvisoryContext {
+                file,
+                advisory_block,
+                protocol_version,
+            } => {
+                assert_eq!(file, "/tmp/test.rs");
+                assert_eq!(advisory_block, "# context");
+                assert_eq!(protocol_version, 0);
+            }
+            _ => panic!("Expected AdvisoryContext"),
+        }
+
+        let current = DaemonResponse::AdvisoryContext {
+            file: "/tmp/test.rs".to_string(),
+            advisory_block: "# context".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+        let serialized = serde_json::to_string(&current).unwrap();
+        let decoded: DaemonResponse = serde_json::from_str(&serialized).unwrap();
+        match decoded {
+            DaemonResponse::AdvisoryContext {
+                protocol_version, ..
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+            }
+            _ => panic!("Expected AdvisoryContext"),
+        }
+    }
+
+    #[test]
+    fn test_protocol_pong_wire_compatibility() {
+        let json = r#""Pong""#;
+        let decoded: DaemonResponse = serde_json::from_str(json).unwrap();
+        assert!(matches!(decoded, DaemonResponse::Pong));
+        let serialized = serde_json::to_string(&DaemonResponse::Pong).unwrap();
+        assert_eq!(serialized, r#""Pong""#);
+    }
+
+    #[test]
+    fn test_protocol_post_read_hook_extended_fields() {
+        let json = r#"{"PostReadHook":{"file":"/tmp/test.rs","total_lines":500,"vendor":"claude","is_full_read":true}}"#;
+        let decoded: DaemonRequest = serde_json::from_str(json).unwrap();
+        match decoded {
+            DaemonRequest::PostReadHook {
+                file,
+                total_lines,
+                vendor,
+                is_full_read,
+                ..
+            } => {
+                assert_eq!(file, PathBuf::from("/tmp/test.rs"));
+                assert_eq!(total_lines, Some(500));
+                assert_eq!(vendor, Some(AgentVendor::Claude));
+                assert_eq!(is_full_read, Some(true));
+            }
+            _ => panic!("Expected PostReadHook"),
+        }
+    }
+
+    #[test]
+    fn test_protocol_distill_backward_compatibility_and_extended_fields() {
+        let legacy_json =
+            r#"{"Distill":{"file":"/tmp/test.rs","mode":"skeleton","format":"markdown"}}"#;
+        let decoded: DaemonRequest = serde_json::from_str(legacy_json).unwrap();
+        match decoded {
+            DaemonRequest::Distill {
+                file,
+                mode,
+                format,
+                start_line,
+                end_line,
+                vendor,
+                cross_boundary,
+            } => {
+                assert_eq!(file, PathBuf::from("/tmp/test.rs"));
+                assert!(matches!(mode, DistillMode::Skeleton));
+                assert!(matches!(format, OutputFormat::Markdown));
+                assert_eq!(start_line, None);
+                assert_eq!(end_line, None);
+                assert_eq!(vendor, None);
+                assert!(!cross_boundary);
+            }
+            _ => panic!("Expected Distill"),
+        }
+
+        let extended_json = r#"{"Distill":{"file":"/tmp/test.rs","mode":"bundle","format":"json","start_line":10,"end_line":25,"vendor":"agy","cross_boundary":true}}"#;
+        let decoded_ext: DaemonRequest = serde_json::from_str(extended_json).unwrap();
+        match decoded_ext {
+            DaemonRequest::Distill {
+                start_line,
+                end_line,
+                vendor,
+                cross_boundary,
+                ..
+            } => {
+                assert_eq!(start_line, Some(10));
+                assert_eq!(end_line, Some(25));
+                assert_eq!(vendor, Some(AgentVendor::Agy));
+                assert!(cross_boundary);
+            }
+            _ => panic!("Expected Distill"),
+        }
     }
 
     #[test]
@@ -407,12 +580,18 @@ mod tests {
                 end_line,
                 raw_read_bytes,
                 read_kind,
+                total_lines,
+                vendor,
+                is_full_read,
             } => {
                 assert_eq!(file, PathBuf::from("/tmp/test.rs"));
                 assert_eq!(start_line, None);
                 assert_eq!(end_line, None);
                 assert_eq!(raw_read_bytes, None);
                 assert_eq!(read_kind, None);
+                assert_eq!(total_lines, None);
+                assert_eq!(vendor, None);
+                assert_eq!(is_full_read, None);
             }
             _ => panic!("Expected PostReadHook"),
         }
@@ -426,12 +605,18 @@ mod tests {
                 end_line,
                 raw_read_bytes,
                 read_kind,
+                total_lines,
+                vendor,
+                is_full_read,
             } => {
                 assert_eq!(file, PathBuf::from("/tmp/test.rs"));
                 assert_eq!(start_line, Some(10));
                 assert_eq!(end_line, Some(40));
                 assert_eq!(raw_read_bytes, Some(850));
                 assert_eq!(read_kind, None);
+                assert_eq!(total_lines, None);
+                assert_eq!(vendor, None);
+                assert_eq!(is_full_read, None);
             }
             _ => panic!("Expected PostReadHook"),
         }

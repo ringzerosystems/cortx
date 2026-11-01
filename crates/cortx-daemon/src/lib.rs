@@ -19,10 +19,12 @@ pub use error::DaemonError;
 pub use hook::{
     execute_post_read_bundle, execute_post_read_bundle_for_project, execute_post_read_hook,
     execute_post_read_hook_for_project, execute_post_read_hook_with_overlay,
+    execute_post_read_query,
 };
 pub use logging::{DaemonLogManager, WorkspaceLogger};
 pub use protocol::{
-    DaemonRequest, DaemonResponse, DaemonStatusInfo, WorkspaceSummary, read_message, write_message,
+    DaemonRequest, DaemonResponse, DaemonStatusInfo, PROTOCOL_VERSION, WorkspaceSummary,
+    read_message, write_message,
 };
 pub use registry::{WorkspaceEntry, WorkspaceRegistry};
 pub use server::{
@@ -127,6 +129,7 @@ mod tests {
         match response {
             DaemonResponse::Status(status) => {
                 assert_eq!(status.pid, std::process::id());
+                assert_eq!(status.protocol_version, PROTOCOL_VERSION);
                 assert_eq!(status.daemon_mode, "Isolated Workspace");
                 assert_eq!(status.workspace_root, PathBuf::from("/test/root"));
                 assert_eq!(status.indexed_files, 1);
@@ -205,7 +208,11 @@ mod tests {
         let src_dir = repo_dir.path().join("src");
         std::fs::create_dir_all(&src_dir).unwrap();
         let test_file = src_dir.join("lib.rs");
-        std::fs::write(&test_file, "pub struct Engine; pub fn start() {}").unwrap();
+        let mut file_content = String::new();
+        for i in 0..200 {
+            file_content.push_str(&format!("pub fn f{}() {{}}\n", i));
+        }
+        std::fs::write(&test_file, &file_content).unwrap();
 
         let index = Arc::new(RwLock::new(SymbolIndex::new()));
         let token = CancellationToken::new();
@@ -227,22 +234,63 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        let hook_resp = send_daemon_request(
+        let macro_resp = send_daemon_request(
             &socket_path,
             DaemonRequest::PostReadHook {
                 file: test_file.clone(),
                 start_line: Some(1),
-                end_line: Some(10),
-                raw_read_bytes: Some(4200),
+                end_line: Some(160),
+                raw_read_bytes: Some(file_content.len() as u64),
                 read_kind: None,
+                total_lines: Some(200),
+                vendor: None,
+                is_full_read: None,
             },
         )
         .await
         .unwrap();
 
-        match hook_resp {
-            DaemonResponse::AdvisoryContext { advisory_block, .. } => {
-                assert!(advisory_block.contains("pub struct Engine"));
+        match macro_resp {
+            DaemonResponse::AdvisoryContext {
+                advisory_block,
+                protocol_version,
+                ..
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert!(advisory_block.contains("## Unread File Outline"));
+                assert!(
+                    advisory_block.contains("f160")
+                        || advisory_block.contains("f161")
+                        || advisory_block.contains("f199")
+                );
+            }
+            _ => panic!("Expected AdvisoryContext response"),
+        }
+
+        let micro_resp = send_daemon_request(
+            &socket_path,
+            DaemonRequest::PostReadHook {
+                file: test_file.clone(),
+                start_line: Some(10),
+                end_line: Some(20),
+                raw_read_bytes: Some(300),
+                read_kind: None,
+                total_lines: Some(200),
+                vendor: None,
+                is_full_read: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        match micro_resp {
+            DaemonResponse::AdvisoryContext {
+                advisory_block,
+                protocol_version,
+                ..
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert_eq!(advisory_block, "");
             }
             _ => panic!("Expected AdvisoryContext response"),
         }
@@ -254,6 +302,7 @@ mod tests {
         match status_resp {
             DaemonResponse::Status(status) => {
                 assert_eq!(status.pid, std::process::id());
+                assert_eq!(status.protocol_version, PROTOCOL_VERSION);
                 assert_eq!(status.daemon_mode, "System-Wide Multi-Tenant");
                 assert!(status.memory_rss_mb >= 0.0);
                 assert_eq!(status.active_workspaces_count, 1);
@@ -264,8 +313,45 @@ mod tests {
                 );
                 assert!(status.workspaces[0].memory_mb > 0.0);
                 assert!(status.workspaces[0].log_path.exists());
-                assert_eq!(status.hooks_served, 1);
-                assert_eq!(status.raw_bytes_served, 4200);
+                assert_eq!(status.hooks_served, 2);
+                assert_eq!(status.omitted_micro_reads, 1);
+                assert!(status.delivered_bytes_served > 0);
+                let delivered_bytes = status.delivered_bytes_served;
+
+                // 0 delivered bytes on subsequent micro-read
+                let micro_resp2 = send_daemon_request(
+                    &socket_path,
+                    DaemonRequest::PostReadHook {
+                        file: test_file.clone(),
+                        start_line: Some(1),
+                        end_line: Some(10),
+                        raw_read_bytes: Some(150),
+                        read_kind: None,
+                        total_lines: Some(200),
+                        vendor: None,
+                        is_full_read: None,
+                    },
+                )
+                .await
+                .unwrap();
+                match micro_resp2 {
+                    DaemonResponse::AdvisoryContext { advisory_block, .. } => {
+                        assert_eq!(advisory_block, "");
+                    }
+                    _ => panic!("Expected AdvisoryContext response"),
+                }
+
+                let status2_resp = send_daemon_request(&socket_path, DaemonRequest::Status)
+                    .await
+                    .unwrap();
+                match status2_resp {
+                    DaemonResponse::Status(s2) => {
+                        assert_eq!(s2.delivered_bytes_served, delivered_bytes);
+                        assert_eq!(s2.omitted_micro_reads, 2);
+                        assert_eq!(s2.hooks_served, 3);
+                    }
+                    _ => panic!("Expected Status response"),
+                }
             }
             _ => panic!("Expected DaemonResponse::Status"),
         }
