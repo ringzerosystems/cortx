@@ -3,7 +3,7 @@
 use crate::error::DistillError;
 use parking_lot::RwLock;
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -1246,14 +1246,14 @@ impl SymbolIndex {
         })
     }
 
-    fn collect_edges_bfs(
+    fn collect_edges_bfs<S: std::hash::BuildHasher>(
         &self,
         map: &FxHashMap<SymbolId, Vec<CompactCallEdge>>,
         next_id_fn: fn(&CompactCallEdge) -> SymbolId,
         symbol: &str,
         depth: usize,
         results: &mut Vec<CallEdge>,
-        seen: &mut HashSet<CallEdge>,
+        mut seen: Option<&mut std::collections::HashSet<CallEdge, S>>,
     ) {
         let mut queue = Vec::new();
         if let Some(start_id) = self.pool.get_id(symbol) {
@@ -1279,18 +1279,29 @@ impl SymbolIndex {
             return;
         }
 
-        let mut visited = HashSet::new();
+        let mut visited = FxHashSet::default();
+        let mut seen_compact = FxHashSet::default();
         while let Some((curr, d)) = queue.pop() {
             if d >= depth || !visited.insert(curr) {
                 continue;
             }
             if let Some(edges) = map.get(&curr) {
                 for edge in edges {
+                    if !seen_compact.insert(*edge) {
+                        continue;
+                    }
                     if let Some(resolved) = edge.resolve(&self.pool) {
-                        if seen.insert(resolved.clone()) {
+                        if let Some(ref mut s) = seen {
+                            if s.insert(resolved.clone()) {
+                                results.push(resolved);
+                            }
+                        } else {
                             results.push(resolved);
                         }
-                        queue.push((next_id_fn(edge), d + 1));
+                    }
+                    let next_id = next_id_fn(edge);
+                    if d + 1 < depth && !visited.contains(&next_id) {
+                        queue.push((next_id, d + 1));
                     }
                 }
             }
@@ -1305,17 +1316,17 @@ impl SymbolIndex {
             symbol,
             depth,
             &mut results,
-            &mut HashSet::new(),
+            None::<&mut FxHashSet<CallEdge>>,
         );
         results
     }
 
-    pub fn collect_callers_into(
+    pub fn collect_callers_into<S: std::hash::BuildHasher>(
         &self,
         symbol: &str,
         depth: usize,
         results: &mut Vec<CallEdge>,
-        seen: &mut HashSet<CallEdge>,
+        seen: &mut std::collections::HashSet<CallEdge, S>,
     ) {
         self.collect_edges_bfs(
             &self.callers_map,
@@ -1323,7 +1334,7 @@ impl SymbolIndex {
             symbol,
             depth,
             results,
-            seen,
+            Some(seen),
         );
     }
 
@@ -1335,17 +1346,17 @@ impl SymbolIndex {
             symbol,
             depth,
             &mut results,
-            &mut HashSet::new(),
+            None::<&mut FxHashSet<CallEdge>>,
         );
         results
     }
 
-    pub fn collect_callees_into(
+    pub fn collect_callees_into<S: std::hash::BuildHasher>(
         &self,
         symbol: &str,
         depth: usize,
         results: &mut Vec<CallEdge>,
-        seen: &mut HashSet<CallEdge>,
+        seen: &mut std::collections::HashSet<CallEdge, S>,
     ) {
         self.collect_edges_bfs(
             &self.callees_map,
@@ -1353,7 +1364,7 @@ impl SymbolIndex {
             symbol,
             depth,
             results,
-            seen,
+            Some(seen),
         );
     }
 

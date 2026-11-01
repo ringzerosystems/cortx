@@ -1,4 +1,5 @@
 use super::*;
+use rustc_hash::FxHashSet;
 
 #[test]
 fn test_indexing_calls_and_contracts() {
@@ -651,7 +652,7 @@ fn test_collect_callers_and_callees_equivalence_and_dedup() {
         .extend(vec![c_edge_b, c_edge_shared]);
 
     let mut callers = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     idx.collect_callers_into("entrypoint", 2, &mut callers, &mut seen);
     assert_eq!(callers.len(), 2);
 
@@ -677,7 +678,7 @@ fn test_collect_callers_and_callees_equivalence_and_dedup() {
         .extend(vec![c_edge_a, c_edge_shared]);
 
     let mut callees = Vec::new();
-    let mut seen_callees = HashSet::new();
+    let mut seen_callees = FxHashSet::default();
     idx.collect_callees_into("caller_shared", 2, &mut callees, &mut seen_callees);
     assert_eq!(callees.len(), 2);
     assert_eq!(callees, vec![edge_a.clone(), edge_shared.clone()]);
