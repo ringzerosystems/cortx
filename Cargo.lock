@@ -173,7 +173,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cargo-cortx"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anstream 0.6.21",
  "clap",
@@ -309,7 +309,7 @@ checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
 
 [[package]]
 name = "cortx-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anstream 0.6.21",
  "clap",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "cortx-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "cortx-core",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "cortx-distill"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cortx-core",
  "globset",
