@@ -1179,3 +1179,69 @@ fn test_distill_skeleton_cache_overlay_override() {
 
     assert_eq!(bundle.skeleton, "/* overlay cached */");
 }
+
+#[test]
+fn test_overlay_view_pass_through_and_contract_dedup() {
+    let mut base_idx = SymbolIndex::new();
+    base_idx.record_call_edge_with_line("caller_base_1", "callee_target", "src/base1.rs", 10);
+    base_idx.record_call_edge_with_line("caller_base_2", "callee_target", "src/shadowed.rs", 20);
+    base_idx.contracts_map.insert(
+        "Widget".to_string(),
+        vec![ContractInfo {
+            trait_name: "Render".to_string(),
+            target_type: "Widget".to_string(),
+            methods: vec!["render".to_string()],
+            file: "src/base1.rs".to_string(),
+        }],
+    );
+
+    // 1. Non-worktree view: pass-through fast-path
+    let fast_view = OverlayView {
+        base: Some(&base_idx),
+        overlay: None,
+        shadowed_files: None,
+    };
+
+    let mut callers = Vec::new();
+    let mut seen = rustc_hash::FxHashSet::default();
+    fast_view.collect_callers_into("callee_target", 1, &mut callers, &mut seen);
+    assert_eq!(callers.len(), 2);
+
+    let contracts = fast_view.get_contracts("Widget");
+    assert_eq!(contracts.len(), 1);
+    assert_eq!(contracts[0].trait_name, "Render");
+
+    // 2. Worktree view: overlay overrides and shadowed files filter
+    let mut overlay_idx = SymbolIndex::new();
+    overlay_idx.record_call_edge_with_line("caller_overlay", "callee_target", "src/overlay.rs", 5);
+    overlay_idx.contracts_map.insert(
+        "Widget".to_string(),
+        vec![ContractInfo {
+            trait_name: "Render".to_string(),
+            target_type: "Widget".to_string(),
+            methods: vec!["render".to_string()],
+            file: "src/base1.rs".to_string(),
+        }],
+    );
+
+    let mut shadowed = HashSet::new();
+    shadowed.insert(PathBuf::from("src/shadowed.rs"));
+
+    let worktree_view = OverlayView {
+        base: Some(&base_idx),
+        overlay: Some(&overlay_idx),
+        shadowed_files: Some(&shadowed),
+    };
+
+    let mut wt_callers = Vec::new();
+    let mut wt_seen = rustc_hash::FxHashSet::default();
+    worktree_view.collect_callers_into("callee_target", 1, &mut wt_callers, &mut wt_seen);
+    let caller_names: Vec<&str> = wt_callers.iter().map(|e| e.caller.as_str()).collect();
+    assert!(caller_names.contains(&"caller_overlay"));
+    assert!(caller_names.contains(&"caller_base_1"));
+    assert!(!caller_names.contains(&"caller_base_2"));
+
+    // Contracts deduplicated across overlay and base
+    let wt_contracts = worktree_view.get_contracts("Widget");
+    assert_eq!(wt_contracts.len(), 1);
+}

@@ -1,6 +1,7 @@
 //! Worktree overlay union view (`overlay ∪ (base \ shadowed_files)`).
 
 use super::{CallEdge, ContractInfo, CrossBoundaryImpact, SymbolDef, SymbolIndex};
+use rustc_hash::FxHashSet;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,14 +47,25 @@ impl<'a> OverlayView<'a> {
         self.is_shadowed(&path.to_string_lossy())
     }
 
-    fn collect_edges(
+    fn collect_edges<S: std::hash::BuildHasher>(
         &self,
         is_callers: bool,
         symbol: &str,
         depth: usize,
         results: &mut Vec<CallEdge>,
-        seen: &mut HashSet<CallEdge>,
+        seen: &mut HashSet<CallEdge, S>,
     ) {
+        if self.overlay.is_none() && self.shadowed_files.is_none_or(|s| s.is_empty()) {
+            if let Some(base_idx) = self.base {
+                if is_callers {
+                    base_idx.collect_callers_into(symbol, depth, results, seen);
+                } else {
+                    base_idx.collect_callees_into(symbol, depth, results, seen);
+                }
+            }
+            return;
+        }
+
         if let Some(ov) = self.overlay {
             if is_callers {
                 ov.collect_callers_into(symbol, depth, results, seen);
@@ -63,7 +75,7 @@ impl<'a> OverlayView<'a> {
         }
         if let Some(base_idx) = self.base {
             let mut base_edges = Vec::new();
-            let mut base_seen = HashSet::new();
+            let mut base_seen = FxHashSet::default();
             if is_callers {
                 base_idx.collect_callers_into(symbol, depth, &mut base_edges, &mut base_seen);
             } else {
@@ -80,17 +92,17 @@ impl<'a> OverlayView<'a> {
     /// Retrieves upstream callers across overlay and base, filtering shadowed files.
     pub fn get_callers(&self, symbol: &str, depth: usize) -> Vec<CallEdge> {
         let mut results = Vec::new();
-        self.collect_edges(true, symbol, depth, &mut results, &mut HashSet::new());
+        self.collect_edges(true, symbol, depth, &mut results, &mut FxHashSet::default());
         results
     }
 
     /// Collects upstream callers across overlay and base, filtering shadowed files.
-    pub fn collect_callers_into(
+    pub fn collect_callers_into<S: std::hash::BuildHasher>(
         &self,
         symbol: &str,
         depth: usize,
         results: &mut Vec<CallEdge>,
-        seen: &mut HashSet<CallEdge>,
+        seen: &mut HashSet<CallEdge, S>,
     ) {
         self.collect_edges(true, symbol, depth, results, seen);
     }
@@ -98,17 +110,17 @@ impl<'a> OverlayView<'a> {
     /// Retrieves downstream callees across overlay and base, filtering shadowed files.
     pub fn get_callees(&self, symbol: &str, depth: usize) -> Vec<CallEdge> {
         let mut results = Vec::new();
-        self.collect_edges(false, symbol, depth, &mut results, &mut HashSet::new());
+        self.collect_edges(false, symbol, depth, &mut results, &mut FxHashSet::default());
         results
     }
 
     /// Collects downstream callees across overlay and base, filtering shadowed files.
-    pub fn collect_callees_into(
+    pub fn collect_callees_into<S: std::hash::BuildHasher>(
         &self,
         symbol: &str,
         depth: usize,
         results: &mut Vec<CallEdge>,
-        seen: &mut HashSet<CallEdge>,
+        seen: &mut HashSet<CallEdge, S>,
     ) {
         self.collect_edges(false, symbol, depth, results, seen);
     }
@@ -119,16 +131,24 @@ impl<'a> OverlayView<'a> {
             .overlay
             .map(|o| o.get_contracts(target_type))
             .unwrap_or_default();
-        let mut seen: HashSet<(String, String, String)> = results
-            .iter()
-            .map(|c| (c.trait_name.clone(), c.target_type.clone(), c.file.clone()))
-            .collect();
+        let mut seen = FxHashSet::default();
+        for c in &results {
+            seen.insert((c.trait_name.as_str(), c.target_type.as_str(), c.file.as_str()));
+        }
 
         if let Some(base_idx) = self.base {
-            for c in base_idx.get_contracts(target_type) {
+            let base_contracts = base_idx.get_contracts(target_type);
+            let mut keep = vec![false; base_contracts.len()];
+            for (i, c) in base_contracts.iter().enumerate() {
                 if !self.is_shadowed(&c.file)
-                    && seen.insert((c.trait_name.clone(), c.target_type.clone(), c.file.clone()))
+                    && seen.insert((c.trait_name.as_str(), c.target_type.as_str(), c.file.as_str()))
                 {
+                    keep[i] = true;
+                }
+            }
+            drop(seen);
+            for (c, kept) in base_contracts.into_iter().zip(keep) {
+                if kept {
                     results.push(c);
                 }
             }
