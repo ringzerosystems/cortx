@@ -159,14 +159,16 @@ def compute_line_offsets(path: str) -> List[int]:
     return offsets
 
 
-def discover_source_files(target_paths: List[str]) -> Tuple[List[str], Dict[str, int]]:
+def discover_source_files(target_paths: List[str]) -> Tuple[List[str], Dict[str, int], List[List[str]]]:
     """
     Discovers Rust, TypeScript, and Go source files across target directories or files.
     Skips build artifacts and hidden environment folders.
+    Returns (all_files_sorted, breakdown_dict, target_groups_list).
     """
     extensions = {".rs", ".ts", ".tsx", ".js", ".jsx", ".go"}
     files: List[str] = []
     breakdown: Dict[str, int] = {}
+    target_groups: List[List[str]] = []
     ignored_dirs = {
         ".git", "target", "node_modules", "dist", "build",
         ".claude", ".cursor", ".gemini", "venv", ".venv",
@@ -180,6 +182,7 @@ def discover_source_files(target_paths: List[str]) -> Tuple[List[str], Dict[str,
             if ext in extensions:
                 files.append(abs_target)
                 breakdown[abs_target] = 1
+                target_groups.append([abs_target])
             continue
 
         if not os.path.isdir(abs_target):
@@ -194,9 +197,11 @@ def discover_source_files(target_paths: List[str]) -> Tuple[List[str], Dict[str,
                     full_p = os.path.join(dirpath, fname)
                     repo_files.append(full_p)
         breakdown[abs_target] = len(repo_files)
+        if repo_files:
+            target_groups.append(sorted(list(set(repo_files))))
         files.extend(repo_files)
 
-    return sorted(list(set(files))), breakdown
+    return sorted(list(set(files))), breakdown, target_groups
 
 
 # ==============================================================================
@@ -213,6 +218,7 @@ def build_distill_request(
     cross_boundary: bool = False,
     vendor: Optional[str] = None,
     vary_bounds: bool = True,
+    warmup_rounds: int = 0,
 ) -> Dict[str, Any]:
     """Constructs a DaemonRequest::Distill payload."""
     abs_path = os.path.abspath(target_file)
@@ -233,7 +239,7 @@ def build_distill_request(
     start_line: Optional[int] = None
     end_line: Optional[int] = None
 
-    if vary_bounds and total_lines > 5 and req_count % 3 != 0:
+    if vary_bounds and total_lines > 5 and req_count >= warmup_rounds and req_count % 3 != 0:
         start_line = rng.randint(1, total_lines)
         if req_count % 2 == 1:
             # Micro-read bounded inspection
@@ -268,6 +274,7 @@ def build_post_read_hook(
     rng: random.Random,
     req_count: int,
     vendor: Optional[str] = None,
+    warmup_rounds: int = 0,
 ) -> Dict[str, Any]:
     """Constructs a DaemonRequest::PostReadHook payload."""
     abs_path = os.path.abspath(target_file)
@@ -277,8 +284,8 @@ def build_post_read_hook(
     if v == "random":
         v = rng.choice(["claude", "agy", "opencode", "generic", None])
 
-    # 1 out of 5 requests simulate bare full-file reads (no range specified)
-    if total_lines <= 0 or req_count % 5 == 0:
+    # Initial warmup round per target workspace, or 1 out of 5 requests simulate bare full-file reads
+    if total_lines <= 0 or req_count < warmup_rounds or req_count % 5 == 0:
         hook_body: Dict[str, Any] = {"file": abs_path}
         if v:
             hook_body["vendor"] = v
@@ -347,12 +354,15 @@ def worker_loop(
     reconnect_per_req: bool,
     stats: WorkerStats,
     seed: int,
+    worker_id: int = 0,
+    target_groups: Optional[List[List[str]]] = None,
 ) -> None:
     rng = random.Random(seed)
     start_time = time.monotonic()
     req_count = 0
     file_idx = rng.randint(0, len(files) - 1) if files else 0
     num_files = len(files)
+    num_groups = len(target_groups) if target_groups else 0
 
     sock: Optional[socket.socket] = None
 
@@ -378,8 +388,15 @@ def worker_loop(
         if max_requests > 0 and req_count >= max_requests:
             break
 
-        target_file = files[file_idx % num_files] if num_files > 0 else ""
-        file_idx += 1
+        if num_groups > 1:
+            group = target_groups[(worker_id + req_count) % num_groups]
+            target_file = group[rng.randint(0, len(group) - 1)] if group else ""
+        elif num_files > 0:
+            target_file = files[file_idx % num_files]
+            file_idx += 1
+        else:
+            target_file = ""
+
         offsets = file_offsets.get(target_file, [0])
 
         category = mode
@@ -391,10 +408,15 @@ def worker_loop(
                 distill_format=distill_format,
                 cross_boundary=cross_boundary,
                 vendor=vendor,
+                warmup_rounds=num_groups,
             )
         elif mode == "hook":
             category = "hook"
-            req = build_post_read_hook(target_file, offsets, rng, req_count, vendor=vendor)
+            req = build_post_read_hook(
+                target_file, offsets, rng, req_count,
+                vendor=vendor,
+                warmup_rounds=num_groups,
+            )
         elif mode == "ping":
             category = "ping"
             req = "Ping"
@@ -412,10 +434,15 @@ def worker_loop(
                     distill_format=distill_format,
                     cross_boundary=cross_boundary,
                     vendor=vendor,
+                    warmup_rounds=num_groups,
                 )
             elif roll < 0.85:
                 category = "hook"
-                req = build_post_read_hook(target_file, offsets, rng, req_count, vendor=vendor)
+                req = build_post_read_hook(
+                    target_file, offsets, rng, req_count,
+                    vendor=vendor,
+                    warmup_rounds=num_groups,
+                )
             elif roll < 0.95:
                 category = "ping"
                 req = "Ping"
@@ -677,7 +704,7 @@ def main() -> None:
     initial_status = query_daemon_status(sock_path)
 
     # Source files discovery
-    files, breakdown = discover_source_files(args.target_dirs)
+    files, breakdown, target_groups = discover_source_files(args.target_dirs)
     if not files and args.mode in ("distill", "hook", "mixed"):
         print(f"Warning: No matching source files (.rs, .ts, .tsx, .js, .jsx, .go) found in {args.target_dirs}.", file=sys.stderr)
 
@@ -698,7 +725,10 @@ def main() -> None:
         if args.vendor:
             print(f"Vendor Cap:      {args.vendor}")
         print(f"Connection:      {'reconnect-per-request' if args.reconnect else 'persistent keep-alive'}")
-        print(f"Target Roots:    {len(args.target_dirs)} path(s)")
+        if len(target_groups) > 1:
+            print(f"Target Roots:    {len(args.target_dirs)} path(s) (balanced across {len(target_groups)} workspace targets)")
+        else:
+            print(f"Target Roots:    {len(args.target_dirs)} path(s)")
         for repo, count in list(breakdown.items())[:5]:
             print(f"  - {repo}: {count} files")
         if len(breakdown) > 5:
@@ -730,6 +760,8 @@ def main() -> None:
                 args.reconnect,
                 worker_stats[i],
                 42 + i,
+                i,
+                target_groups,
             ),
         )
         threads.append(t)
