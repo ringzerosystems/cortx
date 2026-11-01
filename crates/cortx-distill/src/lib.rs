@@ -41,7 +41,7 @@ pub use ts_skeleton::{
 
 pub use cortx_core::model::DistillMode;
 pub use cortx_core::{ReadCoverage, ReadSpan};
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -316,7 +316,22 @@ pub(crate) fn is_test_path(path: &Path) -> bool {
             return true;
         }
     }
-    path.components().any(|c| c.as_os_str() == "tests")
+    let s = path.to_str().unwrap_or("");
+    let s = s.strip_prefix("./").or_else(|| s.strip_prefix(".\\")).unwrap_or(s);
+    if s.starts_with("tests/")
+        || s.starts_with("tests\\")
+        || s.contains("/tests/")
+        || s.contains("\\tests\\")
+        || s.ends_with("/tests")
+        || s.ends_with("\\tests")
+        || s == "tests"
+    {
+        return true;
+    }
+    if path.to_str().is_none() {
+        return path.components().any(|c| c.as_os_str() == "tests");
+    }
+    false
 }
 
 fn is_test_symbol(sym: &str) -> bool {
@@ -350,29 +365,28 @@ fn collect_contracts_view(
         .and_then(|n| n.to_str())
         .unwrap_or("target");
     let mut contracts = view.get_contracts(target_name);
-    let mut seen: HashSet<(String, String, String)> = contracts
-        .iter()
-        .map(|c| (c.trait_name.clone(), c.target_type.clone(), c.file.clone()))
-        .collect();
 
     if let Some(sym_names) = view.get_file_symbols(target_path) {
         for sym in sym_names {
-            for c in view.get_contracts(sym) {
-                if seen.insert((c.trait_name.clone(), c.target_type.clone(), c.file.clone())) {
-                    contracts.push(c);
-                }
-            }
+            contracts.extend(view.get_contracts(sym));
         }
     }
     for def in target_defs {
         if !def.name.is_empty() {
-            for c in view.get_contracts(&def.name) {
-                if seen.insert((c.trait_name.clone(), c.target_type.clone(), c.file.clone())) {
-                    contracts.push(c);
-                }
-            }
+            contracts.extend(view.get_contracts(&def.name));
         }
     }
+
+    let mut seen = FxHashSet::default();
+    let mut keep = vec![false; contracts.len()];
+    for (i, c) in contracts.iter().enumerate() {
+        if seen.insert((c.trait_name.as_str(), c.target_type.as_str(), c.file.as_str())) {
+            keep[i] = true;
+        }
+    }
+    drop(seen);
+    let mut iter = keep.into_iter();
+    contracts.retain(|_| iter.next().unwrap_or(false));
     contracts
 }
 
@@ -387,7 +401,7 @@ fn collect_callers_view(
         .and_then(|n| n.to_str())
         .unwrap_or("target");
     let mut callers = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     view.collect_callers_into(target_name, depth, &mut callers, &mut seen);
     if let Some(sym_names) = view.get_file_symbols(target_path) {
         for sym in sym_names {
@@ -416,7 +430,7 @@ fn collect_callees_view(
         .and_then(|n| n.to_str())
         .unwrap_or("target");
     let mut callees = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     view.collect_callees_into(target_name, depth, &mut callees, &mut seen);
     if let Some(sym_names) = view.get_file_symbols(target_path) {
         for sym in sym_names {
@@ -436,15 +450,20 @@ fn collect_callees_view(
 
 fn normalize_edge_files(edges: &mut [CallEdge], ws_root: Option<&Path>) {
     for edge in edges {
-        let p = Path::new(&edge.file);
         if let Some(root) = ws_root {
-            if let Ok(rel) = p.strip_prefix(root) {
-                edge.file = rel.to_string_lossy().to_string();
-                continue;
+            if edge.file.starts_with('/')
+                || (cfg!(windows)
+                    && (edge.file.starts_with('\\')
+                        || edge.file.as_bytes().get(1) == Some(&b':')))
+            {
+                if let Ok(rel) = Path::new(&edge.file).strip_prefix(root) {
+                    edge.file = rel.to_string_lossy().to_string();
+                    continue;
+                }
             }
         }
-        if let Ok(rel) = p.strip_prefix("./") {
-            edge.file = rel.to_string_lossy().to_string();
+        if edge.file.starts_with("./") || (cfg!(windows) && edge.file.starts_with(".\\")) {
+            edge.file = edge.file[2..].to_string();
         }
     }
 }
@@ -1124,6 +1143,48 @@ mod tests {
     }
 
     #[test]
+    fn test_is_test_path_fast_path() {
+        assert!(is_test_path(Path::new("tests/foo.rs")));
+        assert!(is_test_path(Path::new("./tests/foo.rs")));
+        assert!(is_test_path(Path::new("crates/core/tests/foo.rs")));
+        assert!(is_test_path(Path::new("tests")));
+        assert!(is_test_path(Path::new("service_test.rs")));
+        assert!(is_test_path(Path::new("service_test.go")));
+        assert!(is_test_path(Path::new("service.test.ts")));
+        assert!(!is_test_path(Path::new("src/main.rs")));
+        assert!(!is_test_path(Path::new("crates/cortx-core/src/lib.rs")));
+        assert!(!is_test_path(Path::new("src/testservice.rs")));
+    }
+
+    #[test]
+    fn test_normalize_edge_files_optimization() {
+        let mut edges = vec![
+            CallEdge {
+                caller: "a".into(),
+                callee: "b".into(),
+                file: "/ws/src/main.rs".into(),
+                call_line: 1,
+            },
+            CallEdge {
+                caller: "c".into(),
+                callee: "d".into(),
+                file: "./src/other.rs".into(),
+                call_line: 2,
+            },
+            CallEdge {
+                caller: "e".into(),
+                callee: "f".into(),
+                file: "src/relative.rs".into(),
+                call_line: 3,
+            },
+        ];
+        normalize_edge_files(&mut edges, Some(Path::new("/ws")));
+        assert_eq!(edges[0].file, "src/main.rs");
+        assert_eq!(edges[1].file, "src/other.rs");
+        assert_eq!(edges[2].file, "src/relative.rs");
+    }
+
+    #[test]
     fn test_distill_target_call_graph_equivalence_and_ordering() {
         let dir = tempfile::tempdir().unwrap();
         let service_path = dir.path().join("service.rs");
@@ -1165,7 +1226,7 @@ mod tests {
 
         // Must preserve non-duplicated callers
         assert!(!bundle.callers.is_empty());
-        let callers_set: HashSet<_> = bundle.callers.iter().collect();
+        let callers_set: FxHashSet<_> = bundle.callers.iter().collect();
         assert_eq!(
             callers_set.len(),
             bundle.callers.len(),
@@ -1173,7 +1234,7 @@ mod tests {
         );
 
         // Callees must also have zero duplicates
-        let callees_set: HashSet<_> = bundle.callees.iter().collect();
+        let callees_set: FxHashSet<_> = bundle.callees.iter().collect();
         assert_eq!(
             callees_set.len(),
             bundle.callees.len(),
