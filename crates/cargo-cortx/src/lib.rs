@@ -204,6 +204,10 @@ pub struct DaemonArgs {
     #[arg(long, value_enum, help_heading = "Advisory Tool Hooks")]
     pub vendor: Option<AgentVendor>,
 
+    /// Conversation or session identifier for post-read hook deduplication
+    #[arg(long, help_heading = "Advisory Tool Hooks")]
+    pub session_id: Option<String>,
+
     /// Socket path override
     #[arg(long, help_heading = "Configuration")]
     pub socket: Option<String>,
@@ -648,14 +652,6 @@ async fn handle_daemon_hook_post_read(
         return Ok(());
     };
 
-    // Short-circuit explicit bounded spans <= 150 lines at CLI boundary: immediately return "" (<0.5 ms).
-    if span
-        .effective_line_count(None)
-        .is_some_and(|l| l <= cortx_core::MICRO_READ_MAX_LINES)
-    {
-        return Ok(());
-    }
-
     let budget_env = detect_budget_env(|k| std::env::var(k).ok());
     // Perform at most 1 client-side file read on macro reads: compute metrics once
     let preloaded_source = std::fs::read_to_string(&file).ok();
@@ -689,12 +685,13 @@ async fn handle_daemon_hook_post_read(
             (0, raw, st, en, span.vendor.or(budget_env.env_vendor), cov)
         };
 
-    if coverage == ReadCoverage::Micro {
-        return Ok(());
-    }
-
     let is_full_read = coverage == ReadCoverage::FullFile;
     let read_kind = span.classify(total_lines);
+    let session_id = args
+        .session_id
+        .clone()
+        .or_else(|| parsed_stdin.as_ref().and_then(|p| p.session_id.clone()))
+        .or(budget_env.env_session_id.clone());
 
     let target_dir = if let Some(parent) = file.parent() {
         if parent.as_os_str().is_empty() {
@@ -724,6 +721,7 @@ async fn handle_daemon_hook_post_read(
                 total_lines: Some(total_lines),
                 vendor: effective_vendor,
                 is_full_read: Some(is_full_read),
+                session_id: session_id.clone(),
             },
         )
         .await
@@ -785,6 +783,7 @@ async fn handle_daemon_hook_post_read(
                 preloaded_source: preloaded_source.as_deref(),
                 coverage,
                 vendor: effective_vendor,
+                session_id: session_id.as_deref(),
             };
             let adv = execute_in_process_fallback(params)?;
             (adv, fallback_prov)
@@ -808,6 +807,7 @@ struct FallbackParams<'a> {
     preloaded_source: Option<&'a str>,
     coverage: ReadCoverage,
     vendor: Option<AgentVendor>,
+    session_id: Option<&'a str>,
 }
 
 fn execute_in_process_fallback(
@@ -861,11 +861,17 @@ fn execute_in_process_fallback(
     let bundle = cortx_daemon::execute_post_read_query(&query, view)?;
     let packed = bundle.pack_for_hook(params.coverage);
     let range_str = format_range(params.start_line, params.end_line);
+    let vendor = params.vendor.unwrap_or(AgentVendor::Generic);
+    let session_attr = match params.session_id {
+        Some(sid) => format!("session: '{}' (vendor: {})", sid, vendor),
+        None => format!("session: none (vendor: {})", vendor),
+    };
     tracing::info!(
-        "[{kind_tag}] PostReadHook served fallback advisory context ({} B) for '{}'{}",
+        "[{kind_tag}] PostReadHook served fallback advisory context ({} B) for '{}'{} | {}",
         packed.markdown.len(),
         params.file.display(),
-        range_str
+        range_str,
+        session_attr
     );
     Ok(packed.markdown)
 }
@@ -1074,6 +1080,7 @@ pub fn tail() {
             preloaded_source: Some(content),
             coverage: ReadCoverage::PartialMacro,
             vendor: None,
+            session_id: None,
         };
         let result = execute_in_process_fallback(params);
         assert!(result.is_ok());

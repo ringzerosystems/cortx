@@ -1,0 +1,16 @@
+{
+  "cortx-post-read": {
+    "PostToolUse": [
+      {
+        "matcher": "read_file|view_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo cortx daemon --hook-post-read",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

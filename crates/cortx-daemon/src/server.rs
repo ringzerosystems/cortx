@@ -8,10 +8,15 @@ use crate::protocol::{
     read_message, write_message,
 };
 use crate::registry::{WorkspaceEntry, WorkspaceRegistry};
+use crate::session::{
+    SessionRegistry, format_session_attribution, is_session_repeat, record_session_activity,
+    record_session_file, record_session_repeat,
+};
 use crate::watcher::DynamicWatcherManager;
 use cortx_core::{AgentVendor, ReadCoverage, ReadKind, ReadSpan};
 use cortx_distill::bundle::AdvisoryDisposition;
 use cortx_distill::{DistillMode, DistillQuery, OverlayView, SymbolIndex};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +38,7 @@ pub struct ServerTelemetry {
     pub macro_reads: AtomicU64,
     pub micro_reads: AtomicU64,
     pub omitted_micro_reads: AtomicU64,
+    pub omitted_repeat_reads: AtomicU64,
     pub omitted_full_read_skeletons: AtomicU64,
     pub trimmed_advisories: AtomicU64,
 }
@@ -87,6 +93,11 @@ impl ServerTelemetry {
     /// Returns the total omitted micro reads count.
     pub fn omitted_micro_reads(&self) -> u64 {
         self.omitted_micro_reads.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total omitted repeat reads count within the same session.
+    pub fn omitted_repeat_reads(&self) -> u64 {
+        self.omitted_repeat_reads.load(Ordering::Relaxed)
     }
 
     /// Returns the total omitted full-read skeletons count.
@@ -151,6 +162,7 @@ struct ServerState {
     watcher_manager: Option<Arc<DynamicWatcherManager>>,
     token: CancellationToken,
     telemetry: Arc<ServerTelemetry>,
+    session_history: SessionRegistry,
 }
 
 /// RAII Socket cleaner to remove socket file on drop.
@@ -272,6 +284,7 @@ async fn init_server_state(
         watcher_manager,
         token,
         telemetry: Arc::new(ServerTelemetry::default()),
+        session_history: Arc::new(RwLock::new(HashMap::new())),
     }))
 }
 
@@ -378,6 +391,7 @@ struct PostReadParams<'a> {
     total_lines: Option<usize>,
     vendor: Option<AgentVendor>,
     is_full_read: Option<bool>,
+    session_id: Option<&'a str>,
 }
 
 fn classify_coverage(
@@ -413,10 +427,26 @@ async fn handle_post_read_request(
 ) -> DaemonResponse {
     let file = params.file;
     let env = cortx_core::span::detect_budget_env(|k| std::env::var(k).ok());
+    let effective_vendor = params
+        .vendor
+        .or_else(|| {
+            params.session_id.and_then(|sid| {
+                state
+                    .session_history
+                    .try_read()
+                    .ok()
+                    .and_then(|h| h.get(sid).map(|s| s.vendor))
+            })
+        })
+        .or(env.env_vendor)
+        .unwrap_or(AgentVendor::Generic);
+    let mut params = params;
+    params.vendor = Some(effective_vendor);
+
     let span = ReadSpan {
         start_line: params.start_line,
         end_line: params.end_line,
-        vendor: params.vendor,
+        vendor: Some(effective_vendor),
         ..Default::default()
     };
 
@@ -440,15 +470,26 @@ async fn handle_post_read_request(
             .telemetry
             .omitted_micro_reads
             .fetch_add(1, Ordering::Relaxed);
+        if let Some(sid) = params.session_id {
+            record_session_activity(
+                &state.session_history,
+                sid,
+                effective_vendor,
+                ReadKind::Micro,
+            )
+            .await;
+        }
 
         let raw_len = params.raw_read_bytes.unwrap_or(0);
         state.telemetry.record_hook_metrics(raw_len, 0);
         let elapsed_us = req_start.elapsed().as_micros();
         let range_str = format_range(params.start_line, params.end_line);
+        let session_attr = format_session_attribution(params.session_id, effective_vendor);
         let log_msg = format!(
-            "[MICRO] PostReadHook skipped (micro-read): '{}'{} | raw: {} B | delivered: 0 B | latency: {:.1}ms",
+            "[MICRO] PostReadHook skipped (micro-read): '{}'{} | {} | raw: {} B | delivered: 0 B | latency: {:.1}ms",
             file.display(),
             range_str,
+            session_attr,
             raw_len,
             elapsed_us as f64 / 1000.0,
         );
@@ -464,7 +505,66 @@ async fn handle_post_read_request(
         };
     }
 
-    execute_macro_post_read(params, span, env, req_start, state).await
+    let canon_file = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    let current_mtime = std::fs::metadata(&canon_file)
+        .ok()
+        .and_then(|m| m.modified().ok());
+
+    if let Some(sid) = params.session_id {
+        if is_session_repeat(&state.session_history, sid, &canon_file, current_mtime).await {
+            let entry = state.registry.get(file).await;
+            if let Some(ref ws) = entry {
+                ws.record_read(ReadKind::Macro);
+                ws.record_omitted_repeat_read();
+            }
+            state.telemetry.record_read_kind(ReadKind::Macro);
+            state
+                .telemetry
+                .omitted_repeat_reads
+                .fetch_add(1, Ordering::Relaxed);
+            record_session_repeat(&state.session_history, sid, effective_vendor).await;
+
+            let raw_len = params.raw_read_bytes.unwrap_or(0);
+            state.telemetry.record_hook_metrics(raw_len, 0);
+            let elapsed_us = req_start.elapsed().as_micros();
+            let range_str = format_range(params.start_line, params.end_line);
+            let session_attr = format_session_attribution(Some(sid), effective_vendor);
+            let log_msg = format!(
+                "[REPEAT] PostReadHook skipped (session repeat): '{}'{} | {} | raw: {} B | delivered: 0 B | latency: {:.1}ms",
+                file.display(),
+                range_str,
+                session_attr,
+                raw_len,
+                elapsed_us as f64 / 1000.0,
+            );
+            state.log_manager.log_daemon(&log_msg);
+            if let Some(ref ws) = entry {
+                ws.logger.log(&log_msg);
+            }
+
+            return DaemonResponse::AdvisoryContext {
+                file: file.display().to_string(),
+                advisory_block: String::new(),
+                protocol_version: PROTOCOL_VERSION,
+            };
+        }
+    }
+
+    let sid_opt = params.session_id;
+    let resp = execute_macro_post_read(params, span, env, req_start, state).await;
+    if matches!(&resp, DaemonResponse::AdvisoryContext { .. }) {
+        if let Some(sid) = sid_opt {
+            record_session_file(
+                &state.session_history,
+                sid,
+                effective_vendor,
+                canon_file,
+                current_mtime,
+            )
+            .await;
+        }
+    }
+    resp
 }
 
 fn record_packed_disposition_telemetry(
@@ -626,11 +726,14 @@ async fn execute_macro_post_read(
                 ReadCoverage::PartialMacro => "PARTIAL_MACRO",
             };
 
+            let vendor = params.vendor.unwrap_or(AgentVendor::Generic);
+            let session_attr = format_session_attribution(params.session_id, vendor);
             let log_msg = format!(
-                "[{kind_tag}] PostReadHook served ({:?}): '{}'{} | raw: {} B | delivered: {} B | latency: {:.1}ms",
+                "[{kind_tag}] PostReadHook served ({:?}): '{}'{} | {} | raw: {} B | delivered: {} B | latency: {:.1}ms",
                 packed.disposition,
                 file.display(),
                 range_str,
+                session_attr,
                 raw_len,
                 delivered_len,
                 elapsed_us as f64 / 1000.0,
@@ -647,9 +750,12 @@ async fn execute_macro_post_read(
             }
         }
         Ok(Err(e)) => {
+            let vendor = params.vendor.unwrap_or(AgentVendor::Generic);
+            let session_attr = format_session_attribution(params.session_id, vendor);
             let err_msg = format!(
-                "[MACRO] PostReadHook failed for '{}': {}",
+                "[MACRO] PostReadHook failed for '{}' | {}: {}",
                 file.display(),
+                session_attr,
                 e
             );
             state.log_manager.log_daemon(&err_msg);
@@ -661,9 +767,12 @@ async fn execute_macro_post_read(
             }
         }
         Err(join_err) => {
+            let vendor = params.vendor.unwrap_or(AgentVendor::Generic);
+            let session_attr = format_session_attribution(params.session_id, vendor);
             let err_msg = format!(
-                "[MACRO] PostReadHook task panicked for '{}': {}",
+                "[MACRO] PostReadHook task panicked for '{}' | {}: {}",
                 file.display(),
+                session_attr,
                 join_err
             );
             state.log_manager.log_daemon(&err_msg);
@@ -769,10 +878,12 @@ async fn handle_distill_request(params: DistillParams<'_>, state: &ServerState) 
             let content = bundle.format_with(params.format).unwrap_or_default();
             let delivered_len = content.len() as u64;
             state.telemetry.record_hook_metrics(raw_len, delivered_len);
+            let vendor = params.vendor.unwrap_or(AgentVendor::Generic);
             let log_msg = format!(
-                "Distill served: '{}' (mode: {:?}) | raw: {} B | delivered: {} B | latency: {:.1}ms",
+                "Distill served: '{}' (mode: {:?}) | vendor: {} | raw: {} B | delivered: {} B | latency: {:.1}ms",
                 file.display(),
                 params.mode,
+                vendor,
                 raw_len,
                 delivered_len,
                 elapsed_us as f64 / 1000.0,
@@ -840,6 +951,7 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
             macro_reads: entry.macro_reads(),
             micro_reads: entry.micro_reads(),
             omitted_micro_reads: entry.omitted_micro_reads(),
+            omitted_repeat_reads: entry.omitted_repeat_reads(),
             omitted_full_read_skeletons: entry.omitted_full_read_skeletons(),
             trimmed_advisories: entry.trimmed_advisories(),
             parse_fallbacks: parse_fallbacks as u64,
@@ -894,6 +1006,7 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
         macro_reads: state.telemetry.macro_reads.load(Ordering::Relaxed),
         micro_reads: state.telemetry.micro_reads.load(Ordering::Relaxed),
         omitted_micro_reads: state.telemetry.omitted_micro_reads.load(Ordering::Relaxed),
+        omitted_repeat_reads: state.telemetry.omitted_repeat_reads.load(Ordering::Relaxed),
         omitted_full_read_skeletons: state
             .telemetry
             .omitted_full_read_skeletons
@@ -936,6 +1049,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Resul
                 total_lines,
                 vendor,
                 is_full_read,
+                session_id,
             } => {
                 let params = PostReadParams {
                     file: &file,
@@ -946,6 +1060,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Resul
                     total_lines,
                     vendor,
                     is_full_read,
+                    session_id: session_id.as_deref(),
                 };
                 let resp = handle_post_read_request(params, req_start, &state).await;
                 write_message(&mut stream, &resp).await?;
@@ -1096,6 +1211,7 @@ mod tests {
             total_lines: Some(200),
             vendor: None,
             is_full_read: None,
+            session_id: None,
         };
         let resp_macro = handle_post_read_request(p_macro, std::time::Instant::now(), &state).await;
         match resp_macro {
@@ -1135,6 +1251,7 @@ mod tests {
             total_lines: Some(200),
             vendor: None,
             is_full_read: None,
+            session_id: None,
         };
         let resp_micro = handle_post_read_request(p_micro, std::time::Instant::now(), &state).await;
         match resp_micro {
@@ -1170,6 +1287,7 @@ mod tests {
             total_lines: None,
             vendor: None,
             is_full_read: None,
+            session_id: None,
         };
         let resp_explicit =
             handle_post_read_request(p_explicit, std::time::Instant::now(), &state).await;
@@ -1205,6 +1323,7 @@ mod tests {
             total_lines: Some(200),
             vendor: None,
             is_full_read: Some(true),
+            session_id: None,
         };
         let resp_full = handle_post_read_request(p_full, std::time::Instant::now(), &state).await;
         match resp_full {
@@ -1286,5 +1405,237 @@ mod tests {
         // Shutdown cleanly
         token.cancel();
         let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_post_read_hook_session_repeat_deduplication() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        let opts = ServerOptions {
+            socket_path: dir.path().join("test_session_dedup.sock"),
+            workspace_root: dir.path().to_path_buf(),
+            log_dir: Some(log_dir),
+            ..Default::default()
+        };
+        let index = Arc::new(RwLock::new(SymbolIndex::new()));
+        let token = CancellationToken::new();
+        let state = init_server_state(opts, index, token, std::time::Instant::now())
+            .await
+            .expect("init server state");
+
+        let src_file = dir.path().join("lib.rs");
+        let mut file_content = String::new();
+        for i in 0..200 {
+            file_content.push_str(&format!("pub fn func_{}() {{}}\n", i));
+        }
+        std::fs::write(&src_file, &file_content).unwrap();
+
+        let session_id = "test-session-123";
+
+        // 1. First macro read in session -> delivers advisory context
+        let p1 = PostReadParams {
+            file: &src_file,
+            start_line: Some(1),
+            end_line: Some(160),
+            raw_read_bytes: Some(file_content.len() as u64),
+            read_kind: None,
+            total_lines: Some(200),
+            vendor: None,
+            is_full_read: None,
+            session_id: Some(session_id),
+        };
+        let resp1 = handle_post_read_request(p1, std::time::Instant::now(), &state).await;
+        match resp1 {
+            DaemonResponse::AdvisoryContext { advisory_block, .. } => {
+                assert!(
+                    !advisory_block.is_empty(),
+                    "First read must deliver advisory"
+                );
+            }
+            other => panic!("expected AdvisoryContext, got {:?}", other),
+        }
+        assert_eq!(state.telemetry.macro_reads(), 1);
+        assert_eq!(state.telemetry.omitted_repeat_reads(), 0);
+
+        // 2. Second macro read to same file in same session without edits -> omitted as repeat
+        let p2 = PostReadParams {
+            file: &src_file,
+            start_line: Some(1),
+            end_line: Some(160),
+            raw_read_bytes: Some(file_content.len() as u64),
+            read_kind: None,
+            total_lines: Some(200),
+            vendor: None,
+            is_full_read: None,
+            session_id: Some(session_id),
+        };
+        let resp2 = handle_post_read_request(p2, std::time::Instant::now(), &state).await;
+        match resp2 {
+            DaemonResponse::AdvisoryContext { advisory_block, .. } => {
+                assert_eq!(advisory_block, "", "Repeated read must be omitted");
+            }
+            other => panic!("expected AdvisoryContext, got {:?}", other),
+        }
+        assert_eq!(state.telemetry.macro_reads(), 2);
+        assert_eq!(state.telemetry.omitted_repeat_reads(), 1);
+
+        // 3. Different session reading the same file -> delivers advisory
+        let p3 = PostReadParams {
+            file: &src_file,
+            start_line: Some(1),
+            end_line: Some(160),
+            raw_read_bytes: Some(file_content.len() as u64),
+            read_kind: None,
+            total_lines: Some(200),
+            vendor: None,
+            is_full_read: None,
+            session_id: Some("different-session-456"),
+        };
+        let resp3 = handle_post_read_request(p3, std::time::Instant::now(), &state).await;
+        match resp3 {
+            DaemonResponse::AdvisoryContext { advisory_block, .. } => {
+                assert!(
+                    !advisory_block.is_empty(),
+                    "Different session must deliver advisory"
+                );
+            }
+            other => panic!("expected AdvisoryContext, got {:?}", other),
+        }
+        assert_eq!(state.telemetry.macro_reads(), 3);
+        assert_eq!(state.telemetry.omitted_repeat_reads(), 1);
+
+        // 4. File modified on disk -> same session re-reads -> delivers fresh advisory
+        file_content.push_str("pub fn newly_added() {}\n");
+        // Sleep briefly to ensure mtime ticks forward on coarse filesystems
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        std::fs::write(&src_file, &file_content).unwrap();
+
+        let p4 = PostReadParams {
+            file: &src_file,
+            start_line: Some(1),
+            end_line: Some(160),
+            raw_read_bytes: Some(file_content.len() as u64),
+            read_kind: None,
+            total_lines: Some(201),
+            vendor: None,
+            is_full_read: None,
+            session_id: Some(session_id),
+        };
+        let resp4 = handle_post_read_request(p4, std::time::Instant::now(), &state).await;
+        match resp4 {
+            DaemonResponse::AdvisoryContext { advisory_block, .. } => {
+                assert!(
+                    !advisory_block.is_empty(),
+                    "Modified file must re-deliver advisory"
+                );
+            }
+            other => panic!("expected AdvisoryContext, got {:?}", other),
+        }
+        assert_eq!(state.telemetry.macro_reads(), 4);
+        assert_eq!(state.telemetry.omitted_repeat_reads(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_post_read_hook_session_vendor_activity_logging() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        let opts = ServerOptions {
+            socket_path: dir.path().join("test_session_vendor_log.sock"),
+            workspace_root: dir.path().to_path_buf(),
+            log_dir: Some(log_dir),
+            ..Default::default()
+        };
+        let index = Arc::new(RwLock::new(SymbolIndex::new()));
+        let token = CancellationToken::new();
+        let state = init_server_state(opts, index, token, std::time::Instant::now())
+            .await
+            .expect("init server state");
+
+        let src_file = dir.path().join("service.rs");
+        let mut file_content = String::new();
+        for i in 0..200 {
+            file_content.push_str(&format!("pub fn svc_{}() {{}}\n", i));
+        }
+        std::fs::write(&src_file, &file_content).unwrap();
+
+        // 1. Partial macro read with session and vendor (Agy)
+        let p_macro = PostReadParams {
+            file: &src_file,
+            start_line: Some(1),
+            end_line: Some(160),
+            raw_read_bytes: Some(file_content.len() as u64),
+            read_kind: None,
+            total_lines: Some(200),
+            vendor: Some(AgentVendor::Agy),
+            is_full_read: None,
+            session_id: Some("agy-chat-001"),
+        };
+        let _ = handle_post_read_request(p_macro, std::time::Instant::now(), &state).await;
+
+        // 2. Micro read with same session (vendor inferred from session state)
+        let p_micro = PostReadParams {
+            file: &src_file,
+            start_line: Some(10),
+            end_line: Some(20),
+            raw_read_bytes: Some(300),
+            read_kind: None,
+            total_lines: Some(200),
+            vendor: None,
+            is_full_read: None,
+            session_id: Some("agy-chat-001"),
+        };
+        let _ = handle_post_read_request(p_micro, std::time::Instant::now(), &state).await;
+
+        // 3. Repeat macro read with same session
+        let p_repeat = PostReadParams {
+            file: &src_file,
+            start_line: Some(1),
+            end_line: Some(160),
+            raw_read_bytes: Some(file_content.len() as u64),
+            read_kind: None,
+            total_lines: Some(200),
+            vendor: None,
+            is_full_read: None,
+            session_id: Some("agy-chat-001"),
+        };
+        let _ = handle_post_read_request(p_repeat, std::time::Instant::now(), &state).await;
+
+        // Allow logger channel task to flush
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let log_content = std::fs::read_to_string(state.log_manager.main_log_path())
+            .expect("read main daemon log");
+
+        // Verify macro served has session and vendor
+        assert!(
+            log_content.contains("PostReadHook served"),
+            "log must contain PostReadHook served"
+        );
+        assert!(
+            log_content.contains("session: 'agy-chat-001' (vendor: agy)"),
+            "log must contain session with vendor name for macro read"
+        );
+
+        // Verify micro read has session and vendor
+        assert!(
+            log_content.contains("[MICRO] PostReadHook skipped (micro-read)"),
+            "log must contain micro skipped"
+        );
+        assert!(
+            log_content.contains("[MICRO] PostReadHook skipped (micro-read): '")
+                && log_content.contains("| session: 'agy-chat-001' (vendor: agy) |"),
+            "log must contain session with vendor name for micro read"
+        );
+
+        // Verify repeat read has session and vendor
+        assert!(
+            log_content.contains("[REPEAT] PostReadHook skipped (session repeat)"),
+            "log must contain repeat skipped"
+        );
+        assert!(
+            log_content.contains("[REPEAT] PostReadHook skipped (session repeat): '")
+                && log_content.contains("| session: 'agy-chat-001' (vendor: agy) |"),
+            "log must contain session with vendor name for repeat read"
+        );
     }
 }

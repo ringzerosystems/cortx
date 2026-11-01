@@ -131,7 +131,7 @@ impl Runner for Service {
     assert!(status_out.status.success(), "status must succeed");
     let status_str = String::from_utf8_lossy(&status_out.stdout);
     assert!(status_str.contains("Cortx Daemon Status:  Active"));
-    assert!(status_str.contains("Daemon Version / Protocol:"));
+    assert!(status_str.contains("Version / Protocol:   v"));
     assert!(status_str.contains("protocol v2"));
     assert!(status_str.contains("PID:"));
     assert!(status_str.contains("Uptime:"));
@@ -234,7 +234,7 @@ impl Runner for Service {
     assert!(post_table_str.contains("1 macro, 0 micro"));
     assert!(post_table_str.contains("Supplemental Context:"));
 
-    // 6b. Issue a micro-read hook call (offset: 10, limit: 5) and verify micro_reads short-circuits at CLI
+    // 6b. Issue a micro-read hook call (offset: 10, limit: 5) and verify micro_reads connects to daemon
     let hook_micro_out = cortx_cmd(cortx_bin)
         .args([
             "daemon",
@@ -255,34 +255,8 @@ impl Runner for Service {
     assert!(hook_micro_out.status.success());
     assert!(
         hook_micro_out.stdout.is_empty(),
-        "micro-read must short-circuit with empty output at CLI boundary"
+        "micro-read must return empty advisory output"
     );
-
-    // Send a direct IPC PostReadHook with Micro read kind to verify daemon telemetry
-    let micro_resp = cortx_daemon::send_daemon_request(
-        &socket_path,
-        cortx_daemon::DaemonRequest::PostReadHook {
-            file: test_file.clone(),
-            start_line: Some(10),
-            end_line: Some(14),
-            raw_read_bytes: Some(100),
-            read_kind: Some(cortx_core::ReadKind::Micro),
-            total_lines: Some(73),
-            vendor: Some(cortx_core::span::AgentVendor::Claude),
-            is_full_read: Some(false),
-        },
-    )
-    .await
-    .expect("send direct micro post read hook");
-    match micro_resp {
-        cortx_daemon::DaemonResponse::AdvisoryContext { advisory_block, .. } => {
-            assert!(
-                advisory_block.is_empty(),
-                "daemon micro read must return empty advisory"
-            );
-        }
-        other => panic!("unexpected response: {other:?}"),
-    }
 
     let status_post_micro_json_out = cortx_cmd(cortx_bin)
         .args([
@@ -311,6 +285,84 @@ impl Runner for Service {
             .any(|ws| ws.macro_reads == 1 && ws.micro_reads == 1 && ws.omitted_micro_reads == 1),
         "expected at least one workspace to record 1 macro and 1 micro read"
     );
+
+    // 6c. Verify session deduplication for repeated macro reads
+    let hook_macro_sess1 = cortx_cmd(cortx_bin)
+        .args([
+            "daemon",
+            "--hook-post-read",
+            "--file",
+            test_file.to_str().unwrap(),
+            "--session-id",
+            "test-obs-session",
+            "--socket",
+            socket_path.to_str().unwrap(),
+        ])
+        .current_dir(base.path())
+        .output()
+        .await
+        .expect("macro read with session");
+    assert!(hook_macro_sess1.status.success());
+    let hook_sess1_str = String::from_utf8_lossy(&hook_macro_sess1.stdout);
+    assert!(
+        hook_sess1_str.contains("<!-- cortx-context-provenance: daemon"),
+        "initial session macro read must deliver advisory context"
+    );
+
+    // Repeated macro read to same file with same session-id -> omitted!
+    let hook_macro_sess2 = cortx_cmd(cortx_bin)
+        .args([
+            "daemon",
+            "--hook-post-read",
+            "--file",
+            test_file.to_str().unwrap(),
+            "--session-id",
+            "test-obs-session",
+            "--socket",
+            socket_path.to_str().unwrap(),
+        ])
+        .current_dir(base.path())
+        .output()
+        .await
+        .expect("repeat macro read with session");
+    assert!(hook_macro_sess2.status.success());
+    assert!(
+        hook_macro_sess2.stdout.is_empty(),
+        "repeated session macro read must be omitted to prevent context flooding"
+    );
+
+    let status_post_repeat_json = cortx_cmd(cortx_bin)
+        .args([
+            "daemon",
+            "--status",
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "--json",
+        ])
+        .current_dir(base.path())
+        .output()
+        .await
+        .expect("status post repeat");
+    assert!(status_post_repeat_json.status.success());
+    let post_repeat_status: DaemonStatusInfo =
+        serde_json::from_str(&String::from_utf8_lossy(&status_post_repeat_json.stdout))
+            .expect("valid JSON status post repeat");
+    assert_eq!(post_repeat_status.omitted_repeat_reads, 1);
+
+    let status_post_repeat_table = cortx_cmd(cortx_bin)
+        .args([
+            "daemon",
+            "--status",
+            "--socket",
+            socket_path.to_str().unwrap(),
+        ])
+        .current_dir(base.path())
+        .output()
+        .await
+        .expect("status table post repeat");
+    assert!(status_post_repeat_table.status.success());
+    let post_repeat_table_str = String::from_utf8_lossy(&status_post_repeat_table.stdout);
+    assert!(post_repeat_table_str.contains("1 repeats omitted"));
 
     // 7. Graceful shutdown via --stop
     let stop_out = cortx_cmd(cortx_bin)
@@ -568,6 +620,7 @@ impl Calculator for SimpleCalc {
                         macro_reads: 0,
                         micro_reads: 0,
                         omitted_micro_reads: 0,
+                        omitted_repeat_reads: 0,
                         omitted_full_read_skeletons: 0,
                         trimmed_advisories: 0,
                         parse_fallbacks: 0,

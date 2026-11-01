@@ -44,6 +44,9 @@ pub enum DaemonRequest {
         /// Optional flag indicating whether this is an unbounded or full-file read.
         #[serde(default)]
         is_full_read: Option<bool>,
+        /// Optional conversation/session identifier for deduplicating repeated macro reads.
+        #[serde(default)]
+        session_id: Option<String>,
     },
     /// Request AST context distillation for file.
     Distill {
@@ -113,6 +116,9 @@ pub struct WorkspaceSummary {
     /// Total micro reads with omitted advisory output for this workspace.
     #[serde(default)]
     pub omitted_micro_reads: u64,
+    /// Total repeat reads omitted within the same session for this workspace.
+    #[serde(default)]
+    pub omitted_repeat_reads: u64,
     /// Total full-file reads with omitted self-skeletons for this workspace.
     #[serde(default)]
     pub omitted_full_read_skeletons: u64,
@@ -211,6 +217,9 @@ pub struct DaemonStatusInfo {
     /// Total micro reads with omitted advisory output across all workspaces.
     #[serde(default)]
     pub omitted_micro_reads: u64,
+    /// Total repeat reads omitted within the same session across all workspaces.
+    #[serde(default)]
+    pub omitted_repeat_reads: u64,
     /// Total full-file reads with omitted self-skeletons across all workspaces.
     #[serde(default)]
     pub omitted_full_read_skeletons: u64,
@@ -353,6 +362,7 @@ mod tests {
                 macro_reads: 1,
                 micro_reads: 2,
                 omitted_micro_reads: 1,
+                omitted_repeat_reads: 0,
                 omitted_full_read_skeletons: 2,
                 trimmed_advisories: 0,
                 parse_fallbacks: 0,
@@ -373,6 +383,7 @@ mod tests {
             macro_reads: 1,
             micro_reads: 2,
             omitted_micro_reads: 1,
+            omitted_repeat_reads: 0,
             omitted_full_read_skeletons: 2,
             trimmed_advisories: 0,
             parse_fallbacks: 0,
@@ -583,6 +594,7 @@ mod tests {
                 total_lines,
                 vendor,
                 is_full_read,
+                session_id,
             } => {
                 assert_eq!(file, PathBuf::from("/tmp/test.rs"));
                 assert_eq!(start_line, None);
@@ -592,11 +604,12 @@ mod tests {
                 assert_eq!(total_lines, None);
                 assert_eq!(vendor, None);
                 assert_eq!(is_full_read, None);
+                assert_eq!(session_id, None);
             }
             _ => panic!("Expected PostReadHook"),
         }
 
-        let spanned_json = r#"{"PostReadHook":{"file":"/tmp/test.rs","start_line":10,"end_line":40,"raw_read_bytes":850}}"#;
+        let spanned_json = r#"{"PostReadHook":{"file":"/tmp/test.rs","start_line":10,"end_line":40,"raw_read_bytes":850,"session_id":"sess-123"}}"#;
         let decoded_spanned: DaemonRequest = serde_json::from_str(spanned_json).unwrap();
         match decoded_spanned {
             DaemonRequest::PostReadHook {
@@ -608,6 +621,7 @@ mod tests {
                 total_lines,
                 vendor,
                 is_full_read,
+                session_id,
             } => {
                 assert_eq!(file, PathBuf::from("/tmp/test.rs"));
                 assert_eq!(start_line, Some(10));
@@ -617,6 +631,7 @@ mod tests {
                 assert_eq!(total_lines, None);
                 assert_eq!(vendor, None);
                 assert_eq!(is_full_read, None);
+                assert_eq!(session_id, Some("sess-123".to_string()));
             }
             _ => panic!("Expected PostReadHook"),
         }

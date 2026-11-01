@@ -204,6 +204,7 @@ pub fn trigger_beta_pipeline(svc: &BetaService) -> bool {
         total_lines: None,
         vendor: None,
         is_full_read: None,
+        session_id: None,
     };
     let resp_main = send_daemon_request(&socket_main, req_main).await.unwrap();
     if let DaemonResponse::AdvisoryContext { advisory_block, .. } = resp_main {
@@ -232,6 +233,7 @@ pub fn trigger_beta_pipeline(svc: &BetaService) -> bool {
         total_lines: None,
         vendor: None,
         is_full_read: None,
+        session_id: None,
     };
     let resp_wt = send_daemon_request(&socket_wt, req_wt).await.unwrap();
     if let DaemonResponse::AdvisoryContext { advisory_block, .. } = resp_wt {
@@ -279,6 +281,7 @@ pub fn trigger_beta_pipeline(svc: &BetaService) -> bool {
             total_lines: None,
             vendor: None,
             is_full_read: None,
+            session_id: None,
         },
     )
     .await
@@ -455,6 +458,7 @@ async fn test_worktree_overlay_union_and_deletion_tombstones() {
         total_lines: None,
         vendor: None,
         is_full_read: None,
+        session_id: None,
     };
     let resp_wt = send_daemon_request(&socket_path, req_wt).await.unwrap();
     if let DaemonResponse::AdvisoryContext { advisory_block, .. } = resp_wt {
@@ -495,6 +499,7 @@ async fn test_worktree_overlay_union_and_deletion_tombstones() {
         total_lines: None,
         vendor: None,
         is_full_read: None,
+        session_id: None,
     };
     let resp_parent = send_daemon_request(&socket_path, req_parent).await.unwrap();
     if let DaemonResponse::AdvisoryContext { advisory_block, .. } = resp_parent {
