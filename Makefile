@@ -1,4 +1,4 @@
-.PHONY: help all check build build-debug build-profile test bench bench-compare qa fmt fmt-check clippy deny machete audit loc clean
+.PHONY: help all check build build-debug build-profile install test bench bench-compare qa fmt fmt-check clippy deny machete audit loc clean
 
 help:
 	@echo "Available make targets:"
@@ -8,6 +8,7 @@ help:
 	@echo "  build         - optimized release binaries"
 	@echo "  build-debug   - unoptimized debug binaries"
 	@echo "  build-profile - optimized release binaries with frame pointers for profiling"
+	@echo "  install       - compile release build and install into system cargo path"
 	@echo "  test          - unit & integration tests"
 	@echo "  bench         - run criterion benchmarks"
 	@echo "  bench-compare - compare benchmark results"
@@ -35,6 +36,9 @@ build-profile:
 
 build-debug:
 	cargo build --workspace
+
+install:
+	cargo install --path crates/cargo-cortx --locked --force
 
 test:
 	cargo test --workspace --all-targets
