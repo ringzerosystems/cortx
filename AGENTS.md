@@ -47,6 +47,7 @@ make all               # build all workspace binaries and crates
 make check             # fast workspace compile check (cargo check --workspace --all-targets)
 make build             # optimized release binaries -> target/release/*
 make build-debug       # unoptimized debug binaries -> target/debug/*
+make install           # compile release build and install into system cargo path
 make test              # unit & integration tests (cargo test --workspace --all-targets)
 make bench             # run criterion benchmarks -> target/criterion/
 make bench-compare     # compare baseline against candidate benchmark results
