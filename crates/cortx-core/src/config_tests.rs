@@ -8,6 +8,8 @@ fn test_default_config() {
     assert_eq!(cfg.distill.max_call_depth, 2);
     assert!(cfg.distill.omit_tests);
     assert_eq!(cfg.daemon.socket_path, None);
+    assert_eq!(cfg.daemon.session_ttl_secs, DEFAULT_SESSION_TTL_SECS);
+    assert_eq!(cfg.daemon.session_ttl_secs, 28800);
 }
 
 #[test]
@@ -138,6 +140,7 @@ fn test_daemon_config_multi_tenant_fields() {
 system_daemon = true
 global_socket = "/tmp/global.sock"
 idle_ttl_secs = 3600
+session_ttl_secs = 14400
 enable_file_watcher = false
 log_dir = "/var/log/cortx"
 workspace_logging = true
@@ -152,9 +155,41 @@ workspace_logging = true
         Some("/tmp/global.sock".to_string())
     );
     assert_eq!(cfg.daemon.idle_ttl_secs, 3600);
+    assert_eq!(cfg.daemon.session_ttl_secs, 14400);
     assert!(!cfg.daemon.enable_file_watcher);
     assert_eq!(cfg.daemon.log_dir, Some("/var/log/cortx".to_string()));
     assert!(cfg.daemon.workspace_logging);
+}
+
+#[test]
+fn test_daemon_config_session_ttl_default_and_custom() {
+    use std::io::Write;
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(
+        file,
+        r#"
+[daemon]
+idle_ttl_secs = 1800
+"#
+    )
+    .unwrap();
+
+    let cfg = CortxConfig::load(file.path()).unwrap();
+    assert_eq!(cfg.daemon.idle_ttl_secs, 1800);
+    assert_eq!(cfg.daemon.session_ttl_secs, 28800);
+
+    let mut custom_file = NamedTempFile::new().unwrap();
+    writeln!(
+        custom_file,
+        r#"
+[daemon]
+session_ttl_secs = 3600
+"#
+    )
+    .unwrap();
+
+    let custom_cfg = CortxConfig::load(custom_file.path()).unwrap();
+    assert_eq!(custom_cfg.daemon.session_ttl_secs, 3600);
 }
 
 #[test]
@@ -163,10 +198,12 @@ fn test_config_merge() {
     let mut overlay = CortxConfig::default();
     overlay.general.codebase_scale = "small".to_string();
     overlay.daemon.idle_ttl_secs = 1800;
+    overlay.daemon.session_ttl_secs = 3600;
 
     base.merge(overlay);
     assert_eq!(base.general.codebase_scale, "small");
     assert_eq!(base.daemon.idle_ttl_secs, 1800);
+    assert_eq!(base.daemon.session_ttl_secs, 3600);
 }
 
 #[test]

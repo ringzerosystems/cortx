@@ -431,6 +431,7 @@ async fn test_worktree_overlay_union_and_deletion_tombstones() {
             idle_ttl_secs: 60,
             daemon_config: Default::default(),
             config_path: None,
+            ..Default::default()
         };
         let _ = run_server_with_options(opts, dummy_index, tok).await;
     });

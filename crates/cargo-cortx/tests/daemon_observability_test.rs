@@ -92,6 +92,7 @@ impl Runner for Service {
             idle_ttl_secs: 7200,
             daemon_config: Default::default(),
             config_path: None,
+            ..Default::default()
         };
         let _ = run_server_with_options(opts, index, s_token).await;
     });
