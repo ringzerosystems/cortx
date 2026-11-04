@@ -52,6 +52,15 @@ pub struct CortxConfig {
     /// Configuration for cross-boundary contract correlation.
     #[serde(default)]
     pub cross_boundary: CrossBoundaryConfig,
+    /// Configuration for simulation runner (Pillar 1).
+    #[serde(default)]
+    pub simulate: SimulateConfig,
+    /// Configuration for bounded model checking via Kani (Pillar 3).
+    #[serde(default)]
+    pub verify: VerifyConfig,
+    /// Configuration for differential fuzzing and cross-boundary contract oracles (Pillar 2).
+    #[serde(default)]
+    pub diff_fuzz: DiffFuzzConfig,
     /// Explicitly namespaced projects: `[projects.<name>]`.
     #[serde(default)]
     pub projects: HashMap<String, ProjectConfig>,
@@ -299,6 +308,12 @@ pub struct GoConfig {
     /// Include unexported (lowercase) types and helpers.
     #[serde(default)]
     pub include_private_types: bool,
+    /// Tier 1: Go concurrency and goroutine leak detection options.
+    #[serde(default)]
+    pub concurrency: GoConcurrencyConfig,
+    /// Tier 2: Pure Sans-I/O Go state machine verification options.
+    #[serde(default)]
+    pub state_machine: GoStateMachineConfig,
 }
 
 fn default_go_module_root() -> String {
@@ -318,6 +333,164 @@ impl Default for GoConfig {
             strip_function_bodies: true,
             index_implicit_interfaces: true,
             include_private_types: false,
+            concurrency: GoConcurrencyConfig::default(),
+            state_machine: GoStateMachineConfig::default(),
+        }
+    }
+}
+
+/// Simulation runner configuration options (Pillar 1: Deterministic Simulation Testing).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimulateConfig {
+    /// Default number of seeds to run.
+    #[serde(default = "default_simulate_seeds")]
+    pub default_seeds: u64,
+    /// Execution timeout per simulation run in seconds.
+    #[serde(default = "default_timeout_seconds")]
+    pub timeout_seconds: u64,
+    /// Panic hook mode: "capture_backtrace", "silent", or "abort".
+    #[serde(default = "default_panic_hook")]
+    pub panic_hook: String,
+}
+
+fn default_simulate_seeds() -> u64 {
+    5000
+}
+
+fn default_timeout_seconds() -> u64 {
+    30
+}
+
+fn default_panic_hook() -> String {
+    "capture_backtrace".to_string()
+}
+
+impl Default for SimulateConfig {
+    fn default() -> Self {
+        Self {
+            default_seeds: default_simulate_seeds(),
+            timeout_seconds: default_timeout_seconds(),
+            panic_hook: default_panic_hook(),
+        }
+    }
+}
+
+/// Formal model checking and verification options via Kani (Pillar 3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyConfig {
+    /// Default unwind depth for loops and recursions.
+    #[serde(default = "default_unwind")]
+    pub default_unwind: usize,
+    /// SAT/SMT solver engine ("kissat", "cadical", "z3").
+    #[serde(default = "default_solver")]
+    pub solver: String,
+}
+
+fn default_unwind() -> usize {
+    4
+}
+
+fn default_solver() -> String {
+    "kissat".to_string()
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            default_unwind: default_unwind(),
+            solver: default_solver(),
+        }
+    }
+}
+
+/// Differential fuzzing and cross-boundary contract options (Pillar 2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffFuzzConfig {
+    /// Default number of fuzzing iterations.
+    #[serde(default = "default_diff_fuzz_iterations")]
+    pub default_iterations: u64,
+    /// Path to corpus directory for seed storage.
+    #[serde(default = "default_corpus_dir")]
+    pub corpus_dir: String,
+}
+
+fn default_diff_fuzz_iterations() -> u64 {
+    50000
+}
+
+fn default_corpus_dir() -> String {
+    "fuzz/corpus".to_string()
+}
+
+impl Default for DiffFuzzConfig {
+    fn default() -> Self {
+        Self {
+            default_iterations: default_diff_fuzz_iterations(),
+            corpus_dir: default_corpus_dir(),
+        }
+    }
+}
+
+/// Tier 1: Go concurrency and goroutine leak detection options.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoConcurrencyConfig {
+    /// Enable Go race detector (-race).
+    #[serde(default = "default_true")]
+    pub race_detector: bool,
+    /// Enable uber-go/goleak goroutine leak checks.
+    #[serde(default = "default_true")]
+    pub goleak_check: bool,
+    /// GOMAXPROCS randomized sweep configurations.
+    #[serde(default = "default_gomaxprocs")]
+    pub gomaxprocs_sweep: Vec<usize>,
+    /// Number of concurrency passes.
+    #[serde(default = "default_go_passes")]
+    pub default_passes: u64,
+}
+
+fn default_gomaxprocs() -> Vec<usize> {
+    vec![1, 2, 4, 8]
+}
+
+fn default_go_passes() -> u64 {
+    100
+}
+
+impl Default for GoConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            race_detector: true,
+            goleak_check: true,
+            gomaxprocs_sweep: default_gomaxprocs(),
+            default_passes: default_go_passes(),
+        }
+    }
+}
+
+/// Tier 2: Pure Sans-I/O Go state machine verification options.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoStateMachineConfig {
+    /// Number of transition steps to fuzz.
+    #[serde(default = "default_fuzz_transitions")]
+    pub fuzz_transitions: usize,
+    /// Deterministic seed (hex or u64 string representation).
+    #[serde(default = "default_go_seed")]
+    pub seed: String,
+}
+
+fn default_fuzz_transitions() -> usize {
+    100000
+}
+
+fn default_go_seed() -> String {
+    "0x1337C0DECAFEE00D".to_string()
+}
+
+impl Default for GoStateMachineConfig {
+    fn default() -> Self {
+        Self {
+            fuzz_transitions: default_fuzz_transitions(),
+            seed: default_go_seed(),
         }
     }
 }
@@ -381,6 +554,15 @@ pub struct ProjectConfig {
     /// Per-project cross-boundary contract options.
     #[serde(default)]
     pub cross_boundary: CrossBoundaryConfig,
+    /// Per-project simulation options (Pillar 1).
+    #[serde(default)]
+    pub simulate: SimulateConfig,
+    /// Per-project formal verification options (Pillar 3).
+    #[serde(default)]
+    pub verify: VerifyConfig,
+    /// Per-project differential fuzzing options (Pillar 2).
+    #[serde(default)]
+    pub diff_fuzz: DiffFuzzConfig,
 
     /// Precomputed normalized ignored path prefixes for zero-allocation checks.
     #[serde(skip)]
@@ -410,6 +592,9 @@ impl Default for ProjectConfig {
             typescript: TypeScriptConfig::default(),
             go: GoConfig::default(),
             cross_boundary: CrossBoundaryConfig::default(),
+            simulate: SimulateConfig::default(),
+            verify: VerifyConfig::default(),
+            diff_fuzz: DiffFuzzConfig::default(),
             precomputed_ignored_prefixes: Vec::new(),
             precomputed_ignored_components: HashSet::new(),
         }
@@ -442,6 +627,9 @@ impl ProjectConfig {
             typescript: cfg.typescript.clone(),
             go: cfg.go.clone(),
             cross_boundary: cfg.cross_boundary.clone(),
+            simulate: cfg.simulate.clone(),
+            verify: cfg.verify.clone(),
+            diff_fuzz: cfg.diff_fuzz.clone(),
             ..Default::default()
         };
         proj.normalize();
@@ -820,6 +1008,9 @@ impl CortxConfig {
             "typescript",
             "go",
             "cross_boundary",
+            "simulate",
+            "verify",
+            "diff_fuzz",
             "projects",
         ];
         let dynamic = std::mem::take(&mut self.dynamic_projects);
@@ -947,6 +1138,7 @@ impl CortxConfig {
         self.merge_general_and_distill(&overlay, &def);
         self.merge_daemon(&overlay, &def);
         self.merge_polyglot(&overlay, &def);
+        self.merge_verification(&overlay, &def);
         for (name, mut proj) in overlay.projects {
             proj.normalize();
             self.projects.insert(name, proj);
@@ -1051,6 +1243,24 @@ impl CortxConfig {
         }
         if overlay.cross_boundary != def.cross_boundary {
             self.cross_boundary = overlay.cross_boundary.clone();
+        }
+        if overlay.go.concurrency != def.go.concurrency {
+            self.go.concurrency = overlay.go.concurrency.clone();
+        }
+        if overlay.go.state_machine != def.go.state_machine {
+            self.go.state_machine = overlay.go.state_machine.clone();
+        }
+    }
+
+    fn merge_verification(&mut self, overlay: &CortxConfig, def: &CortxConfig) {
+        if overlay.simulate != def.simulate {
+            self.simulate = overlay.simulate.clone();
+        }
+        if overlay.verify != def.verify {
+            self.verify = overlay.verify.clone();
+        }
+        if overlay.diff_fuzz != def.diff_fuzz {
+            self.diff_fuzz = overlay.diff_fuzz.clone();
         }
     }
 }

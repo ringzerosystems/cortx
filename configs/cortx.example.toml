@@ -9,6 +9,22 @@ session_ttl_secs = 28800
 enable_file_watcher = true
 workspace_logging = true
 
+# ==============================================================================
+# Global Engine Verification Options
+# ==============================================================================
+[simulate]
+default_seeds = 5000
+timeout_seconds = 30
+panic_hook = "capture_backtrace"
+
+[verify]
+default_unwind = 4
+solver = "kissat"
+
+[diff_fuzz]
+default_iterations = 50000
+corpus_dir = "fuzz/corpus"
+
 [projects.acme-fullstack]
 path = "/path/to/acme"
 has_worktrees = true
@@ -35,6 +51,16 @@ lang = ["go"]
 enabled = true
 index_implicit_interfaces = true
 
+[projects.payment-service.go.concurrency]
+race_detector = true
+goleak_check = true
+gomaxprocs_sweep = [1, 2, 4, 8]
+default_passes = 100
+
+[projects.payment-service.go.state_machine]
+fuzz_transitions = 100000
+seed = "0x1337C0DECAFEE00D"
+
 [projects.storage-engine]
 path = "/path/to/storage"
 has_worktrees = false
@@ -43,6 +69,16 @@ lang = ["rust"]
 [projects.storage-engine.distill]
 max_call_depth = 3
 omit_tests = true
+
+[projects.storage-engine.simulate]
+default_seeds = 10000
+timeout_seconds = 60
+
+[projects.storage-engine.verify]
+default_unwind = 8
+
+[projects.storage-engine.diff_fuzz]
+default_iterations = 100000
 
 [projects.web-dashboard]
 path = "/path/to/web"
