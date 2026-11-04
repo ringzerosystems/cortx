@@ -18,7 +18,9 @@ pub const JS_MIN_SAFE_INT: i64 = -9_007_199_254_740_991;
 #[derive(thiserror::Error, Debug)]
 pub enum DiffFuzzError {
     /// Divergence observed between reference and candidate outputs.
-    #[error("differential divergence at iteration {iteration}: reference={reference_output}, candidate={candidate_output}")]
+    #[error(
+        "differential divergence at iteration {iteration}: reference={reference_output}, candidate={candidate_output}"
+    )]
     Divergence {
         /// Iteration index where divergence occurred.
         iteration: u64,
