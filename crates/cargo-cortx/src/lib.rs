@@ -24,6 +24,8 @@ use cortx_distill::{DistillQuery, OverlayView, SymbolIndex, distill_with_query};
 
 mod status_fmt;
 pub(crate) use status_fmt::*;
+pub mod verification_cmds;
+pub use verification_cmds::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -98,6 +100,21 @@ pub enum Commands {
 
     /// Agent Sidecar & Hook Daemon (non-destructive advisory tool hook)
     Daemon(DaemonArgs),
+
+    /// Deterministic Simulation Testing (DST) & Go concurrency sweeps
+    Simulate(SimulateArgs),
+
+    /// Differential Fuzzing Oracle & Cross-Boundary Contract Verification
+    DiffFuzz(DiffFuzzArgs),
+
+    /// Bounded Model Checking via Kani
+    Verify(VerifyArgs),
+
+    /// Metamorphic Invariant Testing & Property Scaffolding
+    Invariants(InvariantArgs),
+
+    /// Sans-I/O Pure Deterministic State Machine Engine
+    StateMachine(StateMachineArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -216,8 +233,8 @@ pub struct DaemonArgs {
 /// Dispatches CLI invocation to corresponding subcommands.
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<String> = std::env::args().collect();
-    // Support `cargo cortx ...` where cargo passes subcommand as second argument
-    if args.len() > 1 && args[1] == "cortx" {
+    // Support `cargo cortx ...` and `cargo cortex ...` where cargo passes subcommand as second argument
+    if args.len() > 1 && (args[1] == "cortx" || args[1] == "cortex") {
         args.remove(1);
     }
 
@@ -269,6 +286,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Some(Commands::Distill(args)) => handle_distill(args, &cfg).await?,
         Some(Commands::Daemon(_)) => unreachable!(),
+        Some(Commands::Simulate(args)) => handle_simulate(args, &cfg).await?,
+        Some(Commands::DiffFuzz(args)) => handle_diff_fuzz(args, &cfg).await?,
+        Some(Commands::Verify(args)) => handle_verify(args, &cfg).await?,
+        Some(Commands::Invariants(args)) => handle_invariants(args, &cfg).await?,
+        Some(Commands::StateMachine(args)) => handle_state_machine(args, &cfg).await?,
         None => {
             Cli::command().print_help()?;
             println!();
@@ -1133,5 +1155,104 @@ pub fn tail() {
         };
         assert_eq!(span_large.effective_line_count(None), Some(200));
         assert!(span_large.effective_line_count(None).unwrap() > cortx_core::MICRO_READ_MAX_LINES);
+    }
+
+    #[test]
+    fn test_verification_subcommands_cli_parsing() {
+        // simulate
+        let cli = Cli::try_parse_from([
+            "cortx",
+            "simulate",
+            "--seeds",
+            "500",
+            "--seed",
+            "0x1337",
+            "--timeout",
+            "10",
+        ])
+        .expect("should parse simulate");
+        match cli.command {
+            Some(Commands::Simulate(args)) => {
+                assert_eq!(args.seeds, Some(500));
+                assert_eq!(args.seed, Some("0x1337".into()));
+                assert_eq!(args.timeout, Some(10));
+            }
+            _ => panic!("expected Simulate command"),
+        }
+
+        // diff-fuzz
+        let cli = Cli::try_parse_from([
+            "cortx",
+            "diff-fuzz",
+            "--cross-boundary",
+            "--iterations",
+            "2000",
+        ])
+        .expect("should parse diff-fuzz");
+        match cli.command {
+            Some(Commands::DiffFuzz(args)) => {
+                assert!(args.cross_boundary);
+                assert_eq!(args.iterations, Some(2000));
+            }
+            _ => panic!("expected DiffFuzz command"),
+        }
+
+        // verify
+        let cli = Cli::try_parse_from([
+            "cortx",
+            "verify",
+            "--unwind",
+            "8",
+            "--solver",
+            "z3",
+            "--scaffold",
+            "MyType",
+        ])
+        .expect("should parse verify");
+        match cli.command {
+            Some(Commands::Verify(args)) => {
+                assert_eq!(args.unwind, Some(8));
+                assert_eq!(args.solver, Some("z3".into()));
+                assert_eq!(args.scaffold, Some("MyType".into()));
+            }
+            _ => panic!("expected Verify command"),
+        }
+
+        // invariants
+        let cli = Cli::try_parse_from([
+            "cortx",
+            "invariants",
+            "--scaffold",
+            "OrderState",
+            "--lang",
+            "typescript",
+        ])
+        .expect("should parse invariants");
+        match cli.command {
+            Some(Commands::Invariants(args)) => {
+                assert_eq!(args.scaffold, Some("OrderState".into()));
+                assert_eq!(args.lang, "typescript");
+            }
+            _ => panic!("expected Invariants command"),
+        }
+
+        // state-machine
+        let cli = Cli::try_parse_from([
+            "cortx",
+            "state-machine",
+            "--fuzz-transitions",
+            "--transitions",
+            "25000",
+            "--matrix",
+        ])
+        .expect("should parse state-machine");
+        match cli.command {
+            Some(Commands::StateMachine(args)) => {
+                assert!(args.fuzz_transitions);
+                assert_eq!(args.transitions, Some(25000));
+                assert!(args.matrix);
+            }
+            _ => panic!("expected StateMachine command"),
+        }
     }
 }

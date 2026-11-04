@@ -181,6 +181,8 @@ dependencies = [
  "cortx-core",
  "cortx-daemon",
  "cortx-distill",
+ "cortx-harness",
+ "cortx-state",
  "mimalloc",
  "serde",
  "serde_json",
