@@ -468,3 +468,147 @@ omit_tests = false
     assert!(!psf.omit_tests);
     assert!(!psf.distill.omit_tests);
 }
+
+#[test]
+fn test_verification_defaults() {
+    let cfg = CortxConfig::default();
+    assert_eq!(cfg.simulate.default_seeds, 5000);
+    assert_eq!(cfg.simulate.timeout_seconds, 30);
+    assert_eq!(cfg.simulate.panic_hook, "capture_backtrace");
+
+    assert_eq!(cfg.verify.default_unwind, 4);
+    assert_eq!(cfg.verify.solver, "kissat");
+
+    assert_eq!(cfg.diff_fuzz.default_iterations, 50000);
+    assert_eq!(cfg.diff_fuzz.corpus_dir, "fuzz/corpus");
+
+    assert!(cfg.go.concurrency.race_detector);
+    assert!(cfg.go.concurrency.goleak_check);
+    assert_eq!(cfg.go.concurrency.gomaxprocs_sweep, vec![1, 2, 4, 8]);
+    assert_eq!(cfg.go.concurrency.default_passes, 100);
+
+    assert_eq!(cfg.go.state_machine.fuzz_transitions, 100000);
+    assert_eq!(cfg.go.state_machine.seed, "0x1337C0DECAFEE00D");
+}
+
+#[test]
+fn test_load_verification_config() {
+    use std::io::Write;
+    let toml = r#"
+[simulate]
+default_seeds = 1000
+timeout_seconds = 15
+panic_hook = "abort"
+
+[verify]
+default_unwind = 2
+solver = "z3"
+
+[diff_fuzz]
+default_iterations = 25000
+corpus_dir = "custom/corpus"
+
+[projects.payment]
+qualified_path = "/srv/payment"
+lang = ["go"]
+
+[projects.payment.go.concurrency]
+race_detector = true
+goleak_check = false
+gomaxprocs_sweep = [2, 4]
+default_passes = 50
+
+[projects.payment.go.state_machine]
+fuzz_transitions = 50000
+seed = "0xDEADBEEF"
+
+[projects.storage]
+qualified_path = "/srv/storage"
+lang = ["rust"]
+
+[projects.storage.simulate]
+default_seeds = 20000
+timeout_seconds = 120
+
+[projects.storage.verify]
+default_unwind = 10
+solver = "cadical"
+
+[projects.storage.diff_fuzz]
+default_iterations = 80000
+corpus_dir = "storage/corpus"
+"#;
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(file, "{}", toml).unwrap();
+    let cfg = CortxConfig::load(file.path()).unwrap();
+
+    assert_eq!(cfg.simulate.default_seeds, 1000);
+    assert_eq!(cfg.simulate.timeout_seconds, 15);
+    assert_eq!(cfg.simulate.panic_hook, "abort");
+
+    assert_eq!(cfg.verify.default_unwind, 2);
+    assert_eq!(cfg.verify.solver, "z3");
+
+    assert_eq!(cfg.diff_fuzz.default_iterations, 25000);
+    assert_eq!(cfg.diff_fuzz.corpus_dir, "custom/corpus");
+
+    let payment = cfg.projects.get("payment").unwrap();
+    assert_eq!(payment.go.concurrency.default_passes, 50);
+    assert!(!payment.go.concurrency.goleak_check);
+    assert_eq!(payment.go.concurrency.gomaxprocs_sweep, vec![2, 4]);
+    assert_eq!(payment.go.state_machine.fuzz_transitions, 50000);
+    assert_eq!(payment.go.state_machine.seed, "0xDEADBEEF");
+
+    let storage = cfg.projects.get("storage").unwrap();
+    assert_eq!(storage.simulate.default_seeds, 20000);
+    assert_eq!(storage.simulate.timeout_seconds, 120);
+    assert_eq!(storage.verify.default_unwind, 10);
+    assert_eq!(storage.verify.solver, "cadical");
+    assert_eq!(storage.diff_fuzz.default_iterations, 80000);
+    assert_eq!(storage.diff_fuzz.corpus_dir, "storage/corpus");
+}
+
+#[test]
+fn test_verification_merge() {
+    let mut base = CortxConfig::default();
+    let mut overlay = CortxConfig::default();
+
+    overlay.simulate.default_seeds = 9999;
+    overlay.verify.solver = "cadical".to_string();
+    overlay.diff_fuzz.default_iterations = 77777;
+    overlay.go.concurrency.default_passes = 250;
+    overlay.go.state_machine.fuzz_transitions = 300000;
+
+    base.merge(overlay);
+
+    assert_eq!(base.simulate.default_seeds, 9999);
+    assert_eq!(base.verify.solver, "cadical");
+    assert_eq!(base.diff_fuzz.default_iterations, 77777);
+    assert_eq!(base.go.concurrency.default_passes, 250);
+    assert_eq!(base.go.state_machine.fuzz_transitions, 300000);
+}
+
+#[test]
+fn test_example_toml_file() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("configs")
+        .join("cortx.example.toml");
+    let cfg = CortxConfig::load(&path).unwrap();
+    assert_eq!(cfg.simulate.default_seeds, 5000);
+    assert_eq!(cfg.verify.solver, "kissat");
+    assert_eq!(cfg.diff_fuzz.default_iterations, 50000);
+
+    let payment = cfg.projects.get("payment-service").unwrap();
+    assert!(payment.go.concurrency.race_detector);
+    assert_eq!(payment.go.concurrency.default_passes, 100);
+    assert_eq!(payment.go.state_machine.fuzz_transitions, 100000);
+
+    let storage = cfg.projects.get("storage-engine").unwrap();
+    assert_eq!(storage.simulate.default_seeds, 10000);
+    assert_eq!(storage.verify.default_unwind, 8);
+    assert_eq!(storage.diff_fuzz.default_iterations, 100000);
+}

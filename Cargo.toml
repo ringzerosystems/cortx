@@ -5,10 +5,12 @@ members = [
     "crates/cortx-distill",
     "crates/cortx-daemon",
     "crates/cargo-cortx",
+    "crates/cortx-state",
+    "crates/cortx-harness",
 ]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.85.0"
 license = "AGPL-3.0-only OR LicenseRef-RingZero-Commercial"
@@ -18,6 +20,8 @@ authors = ["Mark Horila / RingZero Systems <licensing@ringzerosystems.com>"]
 cortx-core = { path = "crates/cortx-core" }
 cortx-distill = { path = "crates/cortx-distill" }
 cortx-daemon = { path = "crates/cortx-daemon" }
+cortx-state = { path = "crates/cortx-state" }
+cortx-harness = { path = "crates/cortx-harness" }
 
 syn = { version = "2.0", features = ["full", "visit", "visit-mut", "extra-traits"] }
 quote = "1.0"
