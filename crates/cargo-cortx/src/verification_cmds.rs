@@ -568,9 +568,7 @@ pub async fn handle_state_machine(
         "StateMachine",
         &format!(
             "Transition fuzzing completed: {} transitions in {:?} ({:.2}M transitions/sec, 0 invariant violations)",
-            report.transitions_executed,
-            elapsed,
-            mops,
+            report.transitions_executed, elapsed, mops,
         ),
     );
 

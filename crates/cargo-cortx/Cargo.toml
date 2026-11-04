@@ -16,10 +16,6 @@ path = "src/main.rs"
 name = "cortx"
 path = "src/cortx.rs"
 
-[[bin]]
-name = "cortex"
-path = "src/cortex.rs"
-
 [dependencies]
 cortx-core = { workspace = true }
 cortx-distill = { workspace = true }

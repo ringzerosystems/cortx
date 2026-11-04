@@ -25,11 +25,11 @@ use cortx_distill::{DistillQuery, OverlayView, SymbolIndex, distill_with_query};
 mod status_fmt;
 pub(crate) use status_fmt::*;
 pub mod verification_cmds;
-pub use verification_cmds::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+pub use verification_cmds::*;
 
 fn clap_styles() -> Styles {
     Styles::styled()
@@ -233,8 +233,8 @@ pub struct DaemonArgs {
 /// Dispatches CLI invocation to corresponding subcommands.
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<String> = std::env::args().collect();
-    // Support `cargo cortx ...` and `cargo cortex ...` where cargo passes subcommand as second argument
-    if args.len() > 1 && (args[1] == "cortx" || args[1] == "cortex") {
+    // Support `cargo cortx ...` where cargo passes subcommand as second argument
+    if args.len() > 1 && args[1] == "cortx" {
         args.remove(1);
     }
 
