@@ -170,6 +170,7 @@ impl WorktreeAuthContract for WorktreeAuth {
             idle_ttl_secs: 7200,
             daemon_config: CortxConfig::default(),
             config_path: None,
+            ..Default::default()
         };
         run_server_with_options(opts, Arc::new(RwLock::new(SymbolIndex::new())), s_tok).await
     });
@@ -385,6 +386,7 @@ ignored_dirs = [".claude"]
             idle_ttl_secs: 7200,
             daemon_config: daemon_cfg,
             config_path,
+            ..Default::default()
         };
         run_server_with_options(opts, Arc::new(RwLock::new(SymbolIndex::new())), s_tok).await
     });
@@ -659,6 +661,7 @@ pub fn wt_modified_caller(engine: &ServiceEngine) -> bool {
             idle_ttl_secs: 7200,
             daemon_config: CortxConfig::default(),
             config_path: None,
+            ..Default::default()
         };
         run_server_with_options(opts, Arc::new(RwLock::new(SymbolIndex::new())), s_tok).await
     });

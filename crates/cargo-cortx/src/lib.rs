@@ -951,6 +951,7 @@ async fn handle_daemon_start(
         watcher_active,
         log_dir: cfg.daemon.log_dir.as_ref().map(PathBuf::from),
         idle_ttl_secs: cfg.daemon.idle_ttl_secs,
+        session_ttl_secs: cfg.daemon.session_ttl_secs,
         daemon_config: cfg.clone(),
         config_path,
     };

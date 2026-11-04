@@ -5,6 +5,7 @@
 system_daemon = true
 lazy_indexing = true
 idle_ttl_secs = 7200
+session_ttl_secs = 28800
 enable_file_watcher = true
 workspace_logging = true
 

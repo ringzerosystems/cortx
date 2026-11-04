@@ -126,6 +126,9 @@ impl Default for DistillConfig {
     }
 }
 
+/// Default agent session inactivity TTL in seconds (8 hours = 28,800 seconds).
+pub const DEFAULT_SESSION_TTL_SECS: u64 = 28800;
+
 /// Background daemon configuration options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonConfig {
@@ -144,6 +147,9 @@ pub struct DaemonConfig {
     /// Inactivity threshold in seconds before unindexing an idle workspace (default: 7200 = 2 hours).
     #[serde(default = "default_idle_ttl_secs")]
     pub idle_ttl_secs: u64,
+    /// Inactivity threshold in seconds before evicting an idle agent session (default: 28800 = 8 hours).
+    #[serde(default = "default_session_ttl_secs")]
+    pub session_ttl_secs: u64,
     /// Whether background filesystem watching is enabled across active workspaces.
     #[serde(default = "default_true")]
     pub enable_file_watcher: bool,
@@ -159,6 +165,10 @@ fn default_idle_ttl_secs() -> u64 {
     7200
 }
 
+fn default_session_ttl_secs() -> u64 {
+    DEFAULT_SESSION_TTL_SECS
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -167,6 +177,7 @@ impl Default for DaemonConfig {
             lazy_indexing: true,
             global_socket: None,
             idle_ttl_secs: default_idle_ttl_secs(),
+            session_ttl_secs: default_session_ttl_secs(),
             enable_file_watcher: true,
             log_dir: None,
             workspace_logging: true,
@@ -989,6 +1000,9 @@ impl CortxConfig {
         }
         if overlay.daemon.idle_ttl_secs != def.daemon.idle_ttl_secs {
             self.daemon.idle_ttl_secs = overlay.daemon.idle_ttl_secs;
+        }
+        if overlay.daemon.session_ttl_secs != def.daemon.session_ttl_secs {
+            self.daemon.session_ttl_secs = overlay.daemon.session_ttl_secs;
         }
         if overlay.daemon.enable_file_watcher != def.daemon.enable_file_watcher {
             self.daemon.enable_file_watcher = overlay.daemon.enable_file_watcher;
